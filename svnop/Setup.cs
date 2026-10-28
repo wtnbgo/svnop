@@ -27,7 +27,7 @@ static class Setup
             Directory.CreateDirectory(Config.Dir);
             File.AppendAllText(Path.Combine(Config.Dir, "setup.log"), $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {line}{Environment.NewLine}");
         }
-        catch (IOException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 
     static void Warn(string line) => Out(L.T("注意: ", "Warning: ") + line);
@@ -264,7 +264,7 @@ static class Setup
                 ["fallback"] = "/usr/bin/pinentry-w32.exe",
             };
             if (opPath != null)
-                json["op"] = ToMsysPath(ResolveLink(opPath));
+                json["op"] = ToMsysPath(opPath);  // FindOp がリンクを実体のパスにしている
             File.WriteAllText(svnopConf, json.ToJsonString(new() { WriteIndented = true }), new UTF8Encoding(false));
         });
 
@@ -405,12 +405,5 @@ static class Setup
         }
         lines.Clear();
         lines.AddRange(result);
-    }
-
-    /// <summary>WinGet の Links はシンボリックリンクなので、msys2 から確実に呼べるよう実体のパスにする</summary>
-    static string ResolveLink(string path)
-    {
-        try { return new FileInfo(path).ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? path; }
-        catch (IOException) { return path; }
     }
 }

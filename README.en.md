@@ -75,6 +75,7 @@ The installer asks for the following.
 | Sync at logon | Shown only with "Save" |
 
 "Set up for TortoiseSVN" registers the agent to start at logon and starts it.
+During setup, 1Password asks for approval once or twice (to check the vault, and for the agent's first sync). Please approve it.
 The result is written to `%APPDATA%\svnop\setup.log`.
 
 Without the installer, extract `svnop-<version>-win-x64.zip` to any folder and run `svnop setup tortoisesvn` (it asks for the mode).

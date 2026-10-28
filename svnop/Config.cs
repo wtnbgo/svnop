@@ -105,22 +105,50 @@ public sealed class Config
         File.WriteAllText(FilePath, JsonSerializer.Serialize(this, JsonOpt));
     }
 
-    /// <summary>op.exe の場所。見つからなければ null</summary>
+    /// <summary>
+    /// op.exe の場所 (シンボリックリンクではなく実体のパス)。見つからなければ null。
+    /// WinGet の Links\op.exe はユーザが作ったシンボリックリンクなので、RedirectionGuard が有効なプロセス
+    /// (インストーラと、そこから起動された svnop / agent) からは、リンク経由の起動もリンク先をたどる解決もできない
+    /// (Win32 エラー 448)。そのため、まず WinGet のパッケージフォルダにある実体を直接探す。
+    /// </summary>
     public string? FindOp()
     {
         if (Op.Length > 0)
-            return File.Exists(Op) ? Op : null;
+            return File.Exists(Op) ? ResolveLink(Op) : null;
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var packages = Path.Combine(local, "Microsoft", "WinGet", "Packages");
+        if (Directory.Exists(packages))
+        {
+            foreach (var dir in Directory.EnumerateDirectories(packages, "AgileBits.1Password.CLI_*"))
+            {
+                var p = Path.Combine(dir, "op.exe");
+                if (File.Exists(p))
+                    return p;
+            }
+        }
         foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
         {
             if (dir.Length == 0)
                 continue;
             var p = Path.Combine(dir.Trim(), "op.exe");
             if (File.Exists(p))
-                return p;
+                return ResolveLink(p);
         }
-        var links = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                                 "Microsoft", "WinGet", "Links", "op.exe");
-        return File.Exists(links) ? links : null;
+        var links = Path.Combine(local, "Microsoft", "WinGet", "Links", "op.exe");
+        return File.Exists(links) ? ResolveLink(links) : null;
+    }
+
+    /// <summary>シンボリックリンクなら、リンク先をたどらずにリンクに書かれた先のパスを返す</summary>
+    public static string ResolveLink(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            if (info.LinkTarget is not { } target)
+                return path;
+            return Path.GetFullPath(target, Path.GetDirectoryName(info.FullName)!);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return path; }
     }
 
     public string ResolveOp() => FindOp() ?? throw new SvnOpException(L.T(

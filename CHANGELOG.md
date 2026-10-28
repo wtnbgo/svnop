@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.1] - 2026-10-28
+
+**Download / ダウンロード**: `svnop-setup-0.2.1.exe` (installer / インストーラ) or `svnop-0.2.1-win-x64.zip`.
+
+- Fix: the setup run by the installer crashed and the agent did not start. The installer runs with RedirectionGuard,
+  which blocks starting `op.exe` through the WinGet `Links` symlink (also inherited by the agent started from the installer);
+  svnop now finds `op.exe` in the WinGet package folder directly
+  / 修正: インストーラから実行した設定が落ち、agent が起動しなかった。インストーラは RedirectionGuard 付きで動き
+  (インストーラから起動した agent にも引き継がれる)、WinGet の `Links` のシンボリックリンク経由では `op.exe` を起動できない。
+  WinGet のパッケージフォルダにある `op.exe` を直接使うようにした
+- The installer explains that 1Password asks for approval during setup
+  / 設定の途中で 1Password の承認画面が出ることを、インストーラに説明として表示する
+- svnop no longer crashes when op cannot be started or when there is no console
+  / op を起動できないときや、コンソールが無いときでも svnop が落ちないようにした
+
 ## [0.2.0] - 2026-10-28
 
 **Download / ダウンロード**: `svnop-setup-0.2.0.exe` (installer / インストーラ) or `svnop-0.2.0-win-x64.zip`.

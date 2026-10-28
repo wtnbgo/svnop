@@ -7,8 +7,13 @@ static class Program
 {
     static async Task<int> Main(string[] args)
     {
-        Console.OutputEncoding = new UTF8Encoding(false);
-        Console.InputEncoding = new UTF8Encoding(false);
+        // コンソールが無い起動のされ方 (インストーラから非表示で実行など) でも落ちないようにする
+        try
+        {
+            Console.OutputEncoding = new UTF8Encoding(false);
+            Console.InputEncoding = new UTF8Encoding(false);
+        }
+        catch (IOException) { }
         if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
         {
             var detail = args.Length > 1 ? Help.For(args[1]) : null;

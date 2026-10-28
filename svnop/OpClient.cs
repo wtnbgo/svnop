@@ -43,7 +43,16 @@ public sealed class OpClient(Config cfg)
             psi.ArgumentList.Add("--vault");
             psi.ArgumentList.Add(cfg.Vault);
         }
-        using var p = Process.Start(psi) ?? throw new SvnOpException(L.T("op を起動できません: ", "cannot start op: ") + _op);
+        Process p;
+        try
+        {
+            p = Process.Start(psi) ?? throw new SvnOpException(L.T("op を起動できません: ", "cannot start op: ") + _op);
+        }
+        catch (System.ComponentModel.Win32Exception e)
+        {
+            throw new SvnOpException(L.T("op を起動できません: ", "cannot start op: ") + $"{_op} ({e.Message})");
+        }
+        using var _ = p;
         // op は stdin を読みながら出力するので、先に読み取りを始めておかないと大きな入力でパイプが詰まる
         var outTask = p.StandardOutput.ReadToEndAsync();
         var errTask = p.StandardError.ReadToEndAsync();

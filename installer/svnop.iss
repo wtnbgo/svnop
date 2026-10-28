@@ -46,6 +46,8 @@ en.VaultTitle=1Password vault
 ja.VaultTitle=1Password のボールト
 en.VaultDesc=Choose the vault for Subversion credentials.
 ja.VaultDesc=Subversion の認証情報を入れるボールトを指定します。
+en.VaultNote=During setup, 1Password will ask you to approve access by svnop (once or twice: to check the vault, and for the first sync by the agent). Please approve it in the 1Password window.
+ja.VaultNote=設定の途中で、svnop からのアクセスを許可するか確認する 1Password の承認画面が 1〜2 回表示されます (ボールトの確認と、agent の最初の同期のため)。1Password の画面で承認してください。
 en.VaultPrompt=Vault name (empty = op's default vault). Create the vault in 1Password beforehand.
 ja.VaultPrompt=ボールト名 (空なら op の既定のボールト)。ボールトは事前に 1Password で作成してください。
 en.NoRuntime=.NET 10 Desktop Runtime is not installed. svnop needs it.%n%nOpen the download page?
@@ -169,7 +171,7 @@ end;
 
 procedure InitializeWizard;
 begin
-  VaultPage := CreateInputQueryPage(wpSelectTasks, CustomMessage('VaultTitle'), CustomMessage('VaultDesc'), '');
+  VaultPage := CreateInputQueryPage(wpSelectTasks, CustomMessage('VaultTitle'), CustomMessage('VaultDesc'), CustomMessage('VaultNote'));
   VaultPage.Add(CustomMessage('VaultPrompt'), False);
   VaultPage.Values[0] := ConfigValue('vault', 'SVN');
 
