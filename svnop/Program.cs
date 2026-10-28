@@ -33,6 +33,7 @@ static class Program
             return args[0] switch
             {
                 "setup" => Setup.Run(opts),
+                "config" => ConfigCmd(opts),
                 "realm" => await RealmCmd(opts),
                 "add" => await AddCmd(opts),
                 "find" => await FindCmd(opts),
@@ -56,6 +57,33 @@ static class Program
         {
             Console.Error.WriteLine(T("エラー: ", "Error: ") + e.Message);
             return 2;
+        }
+    }
+
+    /// <summary>svnop config / svnop config KEY / svnop config KEY VALUE</summary>
+    static int ConfigCmd(Options o)
+    {
+        var cfg = Config.Load();
+        switch (o.Positional.Count)
+        {
+            case 0:
+                foreach (var k in Config.Keys)
+                    Console.WriteLine($"{k} = {cfg.Get(k)}");
+                Console.Error.WriteLine(Path.Combine(Config.Dir, "config.json"));
+                return 0;
+            case 1:
+                Console.WriteLine(cfg.Get(o.Positional[0]));
+                return 0;
+            case 2:
+                cfg.Set(o.Positional[0], o.Positional[1]);
+                cfg.Save();
+                Console.WriteLine($"{o.Positional[0]} = {cfg.Get(o.Positional[0])}");
+                if (Agent.Call(new() { ["cmd"] = "ping" }, 300) != null)
+                    Console.WriteLine(T("(常駐中の agent には次にメニューを開いたときか、次の起動時に反映されます)",
+                                        "(the running agent picks this up the next time its menu opens, or at its next start)"));
+                return 0;
+            default:
+                throw new SvnOpException(T("使い方: svnop config [キー [値]]", "usage: svnop config [key [value]]"));
         }
     }
 
@@ -127,8 +155,8 @@ static class Program
         var id = op.Save(realm, user, pw, existing);
         Console.WriteLine((existing != null ? T("更新しました: ", "Updated: ") : T("登録しました: ", "Added: "))
                           + $"{OpClient.Title(realm, user)} ({id})");
-        // TortoiseSVN の svn.exe (コンソール) からもすぐ使えるよう、キャッシュにも書く。明示的に登録した値なので既存より優先する
-        if (!o.Has("no-cache"))
+        // キャッシュを保存する方針なら、TortoiseSVN の svn.exe からもすぐ使えるようキャッシュにも書く (明示的に登録した値なので既存より優先)
+        if (!o.Has("no-cache") && Config.Load().KeepCache)
             CacheSync.Sync([new SvnItem(id, realm, user, pw, null)], dryRun: false, force: true, Console.WriteLine);
         return 0;
     }
@@ -265,7 +293,11 @@ static class Program
     static int SyncCmd(Options o)
     {
         var dryRun = o.Has("dry-run");
-        var items = new OpClient(Config.Load()).ListWithPasswords();
+        var cfg = Config.Load();
+        if (cfg.CacheMode == Config.NoCache && !o.Has("force"))
+            throw new SvnOpException(T("キャッシュを保存しない設定です。変えるときは svnop config cacheMode keep (今回だけなら --force)",
+                                       "the cache mode is \"none\" (do not save). Change it with svnop config cacheMode keep (or use --force once)"));
+        var items = new OpClient(cfg).ListWithPasswords();
         var r = CacheSync.Sync(items, dryRun, o.Has("force"), Console.WriteLine);
         Console.WriteLine(r.Summary(dryRun));
         return 0;

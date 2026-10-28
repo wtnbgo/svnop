@@ -63,12 +63,26 @@ static class Setup
     {
         Out(L.T("TortoiseSVN 向けの設定", "Setting up for TortoiseSVN"));
         var cfg = Config.Load();
-        if (o.Get("vault") is { } vault && vault != cfg.Vault)
-            Do(L.T($"config.json にボールト「{vault}」を記録", $"store vault \"{vault}\" in config.json"), () =>
-            {
-                cfg.Vault = vault;
-                cfg.Save();
-            });
+
+        // 指定された設定を config.json に記録する (省略されたものは今の値のまま)
+        var changes = new List<(string Key, string Value)>();
+        if (o.Get("vault") is { } vault) changes.Add(("vault", vault));
+        if (o.Get("language") is { } lang) changes.Add(("language", lang));
+        if (o.Get("cache") is { } cache) changes.Add(("cacheMode", cache));
+        else if (!cfg.CacheModeChosen && !Console.IsInputRedirected && !_dry)
+            changes.Add(("cacheMode", AskCacheMode()));
+        if (o.Get("sync-on-start") is { } sync) changes.Add(("syncOnStart", sync));
+        foreach (var (key, value) in changes)
+        {
+            var before = cfg.Get(key);
+            cfg.Set(key, value);  // 値の検査を兼ねる
+            if (before != cfg.Get(key))
+                Do(L.T($"config.json: {key} = {cfg.Get(key)}", $"config.json: {key} = {cfg.Get(key)}"), cfg.Save);
+        }
+        Out(cfg.CacheModeChosen
+            ? L.T($"- 認証キャッシュ: {(cfg.KeepCache ? "保存する" : "保存しない")}{(cfg.KeepCache ? (cfg.SyncOnStart ? " / ログオン時に同期する" : " / ログオン時に同期しない") : "")}",
+                  $"- credential cache: {(cfg.KeepCache ? "save" : "do not save")}{(cfg.KeepCache ? (cfg.SyncOnStart ? " / sync at logon" : " / no sync at logon") : "")}")
+            : L.T("- 認証キャッシュ: 未選択 (agent の初回起動時に聞きます)", "- credential cache: not chosen yet (the agent asks at first start)"));
         CheckOp(cfg);
 
         var w = Path.Combine(AppDir, "svnopw.exe");
@@ -90,9 +104,34 @@ static class Setup
         Out(L.T("次の手順:", "Next steps:"));
         Out(L.T("  既存のキャッシュを 1Password に取り込む:  svnop import --adopt",
                 "  import the existing cache into 1Password:  svnop import --adopt"));
-        Out(L.T("  1Password からキャッシュを作る:          svnop sync",
-                "  write the cache from 1Password:            svnop sync"));
+        if (cfg.KeepCache)
+            Out(L.T("  1Password からキャッシュを作る:          svnop sync",
+                    "  write the cache from 1Password:            svnop sync"));
         return 0;
+    }
+
+    /// <summary>対話的に認証キャッシュの方針を聞く (コンソールから setup を実行したとき)</summary>
+    static string AskCacheMode()
+    {
+        Console.WriteLine(L.T(
+            """
+
+            TortoiseSVN の認証キャッシュ (%APPDATA%\Subversion) にパスワードを保存しますか?
+              1) 保存する (おすすめ)  TortoiseSVN もコマンドライン版 svn.exe もキャッシュで認証する。
+                                      キャッシュに無いときは svnop が自動入力して保存する
+              2) 保存しない           ディスクにパスワードを残さない。TortoiseSVN は毎回 svnop が自動入力する。
+                                      コマンドライン版 svn.exe は毎回パスワードを聞かれる
+            """,
+            """
+
+            Save passwords in TortoiseSVN's credential cache (%APPDATA%\Subversion)?
+              1) Save (recommended)   Both TortoiseSVN and the command-line svn.exe authenticate from the cache.
+                                      Missing entries are auto-filled by svnop and saved
+              2) Do not save          No passwords on disk. svnop fills TortoiseSVN's dialog every time.
+                                      The command-line svn.exe asks for the password every time
+            """));
+        Console.Write(L.T("番号 [1]: ", "Number [1]: "));
+        return Console.ReadLine()?.Trim() == "2" ? Config.NoCache : Config.Keep;
     }
 
     /// <summary>op が使えるか、ボールトがあるかを確かめる (失敗しても設定は続ける)</summary>

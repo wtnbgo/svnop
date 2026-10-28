@@ -51,27 +51,180 @@ sealed class Agent : ApplicationContext
     {
         _op = new OpClient(_cfg);
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
-        var menu = new ContextMenuStrip();
-        menu.Items.Add(T("1Password から同期 (sync)", "Sync from 1Password"), null, (_, _) => _ = RunSync(notify: true, retries: 0));
-        menu.Items.Add(T("キャッシュを消す (lock)", "Clear the cache (lock)"), null, (_, _) => RunLock());
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(T("ログを開く", "Open log"), null, (_, _) => Process.Start(new ProcessStartInfo(LogPath) { UseShellExecute = true }));
-        menu.Items.Add(T("終了", "Exit"), null, (_, _) => Quit());
         _tray = new NotifyIcon
         {
             Icon = SystemIcons.Shield,
             Text = "svnop agent (Subversion × 1Password)",
             Visible = true,
-            ContextMenuStrip = menu,
         };
+        _tray.ContextMenuStrip = BuildMenu();
         _timer.Tick += (_, _) => Poll();
         _timer.Start();
         new Thread(PipeLoop) { IsBackground = true, Name = "svnop-pipe" }.Start();
-        Log($"agent start pid={Environment.ProcessId} pipe={PipeName} tsvn={AuthDialog.TsvnBinDir}");
-        // ログオン直後は 1Password がまだ起動・解錠されていないことがあるので、失敗したら間を置いて数回やり直す
-        if (_cfg.SyncOnStart)
+        Log($"agent start pid={Environment.ProcessId} pipe={PipeName} tsvn={AuthDialog.TsvnBinDir} cacheMode={_cfg.CacheMode}");
+        if (!_cfg.CacheModeChosen)
+            _ui.Post(_ => ChooseCacheMode(), null);  // 初回: メッセージループが回ってから方針を聞く
+        else if (_cfg.KeepCache && _cfg.SyncOnStart)
+            // ログオン直後は 1Password がまだ起動・解錠されていないことがあるので、失敗したら間を置いて数回やり直す
             _ = RunSync(notify: false, retries: 5);
         StartWatcher();
+    }
+
+    // ---- トレイメニュー ----
+
+    ContextMenuStrip BuildMenu()
+    {
+        var menu = new ContextMenuStrip();
+        var sync = new ToolStripMenuItem(T("1Password から同期 (sync)", "Sync from 1Password"), null, (_, _) => _ = RunSync(notify: true, retries: 0));
+        menu.Items.Add(sync);
+        menu.Items.Add(T("キャッシュを消す (lock)", "Clear the cache (lock)"), null, (_, _) => RunLock());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(BuildSettingsMenu());
+        menu.Items.Add(T("ヘルプ (README)", "Help (README)"), null, (_, _) => OpenReadme());
+        menu.Items.Add(T("ログを開く", "Open log"), null, (_, _) => Process.Start(new ProcessStartInfo(LogPath) { UseShellExecute = true }));
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(T("終了", "Exit"), null, (_, _) => Quit());
+        // キャッシュを保存しない方針のときは同期できない
+        menu.Opening += (_, _) =>
+        {
+            ReloadConfig();
+            sync.Enabled = _cfg.KeepCache;
+        };
+        return menu;
+    }
+
+    /// <summary>手で編集された config.json を反映する (vault 等の文字列は OpClient が同じオブジェクトを見ている)</summary>
+    void ReloadConfig()
+    {
+        Config fresh;
+        try { fresh = Config.Load(); }
+        catch (SvnOpException e) { Log(e.Message); return; }
+        _cfg.CacheMode = fresh.CacheMode;
+        _cfg.SyncOnStart = fresh.SyncOnStart;
+        _cfg.NotifyOnFill = fresh.NotifyOnFill;
+        _cfg.AutoSubmit = fresh.AutoSubmit;
+        _cfg.Language = fresh.Language;
+        _cfg.Vault = fresh.Vault;
+    }
+
+    ToolStripMenuItem BuildSettingsMenu()
+    {
+        var root = new ToolStripMenuItem(T("設定", "Settings"));
+        var vault = new ToolStripMenuItem { Enabled = false };
+
+        // 認証キャッシュの方針 (排他)
+        var cacheHead = new ToolStripMenuItem(T("認証キャッシュにパスワードを:", "Passwords in the credential cache:")) { Enabled = false };
+        var keep = new ToolStripMenuItem(T("保存する (svn.exe も使える)", "Save (svn.exe works too)"), null, (_, _) => SetCacheMode(Config.Keep));
+        var none = new ToolStripMenuItem(T("保存しない (GUI は毎回自動入力)", "Do not save (GUI is auto-filled every time)"), null, (_, _) => SetCacheMode(Config.NoCache));
+        var syncOnStart = new ToolStripMenuItem(T("    ログオン時に 1Password から同期する", "    Sync from 1Password at logon"), null, (_, _) =>
+        {
+            _cfg.SyncOnStart = !_cfg.SyncOnStart;
+            _cfg.Save();
+            Log($"setting: syncOnStart = {_cfg.SyncOnStart}");
+        });
+
+        ToolStripMenuItem Toggle(string ja, string en, Func<bool> get, Action<bool> set, string key) =>
+            new(T(ja, en), null, (_, _) =>
+            {
+                set(!get());
+                _cfg.Save();
+                Log($"setting: {key} = {get()}");
+            });
+        var notify = Toggle("自動入力したら通知する", "Notify when auto-filled", () => _cfg.NotifyOnFill, v => _cfg.NotifyOnFill = v, "notifyOnFill");
+        var submit = Toggle("自動入力の後に OK を押す", "Press OK after auto-fill", () => _cfg.AutoSubmit, v => _cfg.AutoSubmit = v, "autoSubmit");
+
+        // 表示言語
+        var lang = new ToolStripMenuItem(T("表示言語", "Language"));
+        var langItems = new[] { ("auto", T("自動 (Windows に合わせる)", "Auto (follow Windows)")), ("ja", "日本語"), ("en", "English") }
+            .Select(x => (Key: x.Item1, Item: new ToolStripMenuItem(x.Item2, null, (_, _) => SetLanguage(x.Item1)))).ToList();
+        foreach (var (_, item) in langItems)
+            lang.DropDownItems.Add(item);
+
+        root.DropDownItems.AddRange([
+            vault, new ToolStripSeparator(),
+            cacheHead, keep, syncOnStart, none, new ToolStripSeparator(),
+            notify, submit, new ToolStripSeparator(),
+            lang,
+            new ToolStripMenuItem(T("設定ファイルを開く", "Open config file"), null, (_, _) =>
+            {
+                var path = Path.Combine(Config.Dir, "config.json");
+                if (!File.Exists(path))
+                    _cfg.Save();
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+            }),
+        ]);
+        root.DropDownOpening += (_, _) =>
+        {
+            ReloadConfig();
+            vault.Text = T("ボールト: ", "Vault: ") + (_cfg.Vault.Length > 0 ? _cfg.Vault : T("(op の既定)", "(op default)"));
+            keep.Checked = _cfg.KeepCache;
+            none.Checked = _cfg.CacheMode == Config.NoCache;
+            syncOnStart.Checked = _cfg.SyncOnStart;
+            syncOnStart.Enabled = _cfg.KeepCache;
+            notify.Checked = _cfg.NotifyOnFill;
+            submit.Checked = _cfg.AutoSubmit;
+            foreach (var (key, item) in langItems)
+                item.Checked = _cfg.Language == key;
+        };
+        return root;
+    }
+
+    /// <summary>初回起動時に方針を聞く (閉じられたら次回また聞く)</summary>
+    void ChooseCacheMode()
+    {
+        using var form = new CacheModeForm(_cfg);
+        if (form.ShowDialog() != DialogResult.OK)
+        {
+            Log("cache mode not chosen (will ask again next time)");
+            return;
+        }
+        _cfg.CacheMode = form.Mode;
+        _cfg.SyncOnStart = form.SyncOnStart;
+        _cfg.Save();
+        Log($"setting: cacheMode = {_cfg.CacheMode}, syncOnStart = {_cfg.SyncOnStart}");
+        if (_cfg.KeepCache && _cfg.SyncOnStart)
+            _ = RunSync(notify: true, retries: 5);
+    }
+
+    void SetCacheMode(string mode)
+    {
+        if (_cfg.CacheMode == mode)
+            return;
+        _cfg.CacheMode = mode;
+        _cfg.Save();
+        Log($"setting: cacheMode = {mode}");
+        if (mode == Config.NoCache)
+        {
+            var count = ManagedList.Load().Files.Keys.Count(File.Exists);
+            if (count > 0 && MessageBox.Show(
+                    T($"svnop が書いた認証キャッシュが {count} 件あります。今消しますか?\n(消さない場合も、以後 svnop はキャッシュに書き込みません)",
+                      $"There are {count} cache entries written by svnop. Delete them now?\n(Either way, svnop will no longer write to the cache.)"),
+                    "svnop", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                RunLock();
+        }
+        else if (MessageBox.Show(T("今すぐ 1Password からキャッシュを同期しますか?", "Sync the cache from 1Password now?"),
+                                 "svnop", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+            _ = RunSync(notify: true, retries: 0);
+    }
+
+    void SetLanguage(string lang)
+    {
+        _cfg.Language = lang;
+        _cfg.Save();
+        L.Ja = L.Detect();
+        // メニューの文言を作り直す
+        var old = _tray.ContextMenuStrip;
+        _tray.ContextMenuStrip = BuildMenu();
+        old?.Dispose();
+        Log($"setting: language = {lang}");
+    }
+
+    void OpenReadme()
+    {
+        var dir = AppContext.BaseDirectory;
+        var file = Path.Combine(dir, L.Ja ? "README.md" : "README.en.md");
+        var target = File.Exists(file) ? file : "https://github.com/wtnbgo/svnop#readme";
+        Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
     }
 
     // ---- キャッシュの同期 / 削除 ----
@@ -298,6 +451,9 @@ sealed class Agent : ApplicationContext
         {
             Fill(dlg, item.Username, pw);
             Log($"filled: {dlg.Realm} ({item.Username}) pid={dlg.Pid}");
+            if (_cfg.NotifyOnFill)
+                _tray.ShowBalloonTip(3000, "svnop", T("1Password から入力しました", "Filled from 1Password")
+                                     + $"\n{dlg.Realm}\n({item.Username})", ToolTipIcon.Info);
             return;
         }
 
@@ -326,8 +482,7 @@ sealed class Agent : ApplicationContext
                     Log($"{(existing != null ? "updated" : "added")} in 1Password: {dlg.Realm} ({form.User}) {id}");
                     return id;
                 });
-                // TortoiseSVN の svn.exe (コンソール) からも使えるよう、キャッシュにも書く
-                CacheSync.Sync([new SvnItem(id, dlg.Realm, form.User, form.Password, null)], dryRun: false, force: true, Log);
+                // キャッシュへの保存は TortoiseSVN に任せる (保存する方針なら「認証を保存」付きで送るので、成功したときだけ保存される)
             }
             catch (Exception e) when (e is SvnOpException or IOException)
             {
@@ -343,7 +498,8 @@ sealed class Agent : ApplicationContext
     void Fill(AuthDialog dlg, string user, string password)
     {
         _lastFill[(dlg.Pid, dlg.Realm)] = DateTime.Now;
-        dlg.Fill(user, password, _cfg.SaveAuth, _cfg.AutoSubmit);
+        // キャッシュを保存する方針なら「認証を保存」を付けたまま送る (認証に成功したときだけ TortoiseSVN が保存する)
+        dlg.Fill(user, password, saveAuth: _cfg.KeepCache, _cfg.AutoSubmit);
     }
 
     // ---- 名前付きパイプ (1 行 JSON の要求 → 1 行 JSON の応答) ----

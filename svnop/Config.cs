@@ -10,8 +10,23 @@ public sealed class Config
     public string Tag { get; set; } = "svn";
     public string RealmField { get; set; } = "svn_realm";
     public bool AutoSubmit { get; set; } = true;      // agent: 入力後に OK を押す
-    public bool SaveAuth { get; set; } = false;       // agent: TortoiseSVN の「認証を保存」を残すか
-    public bool SyncOnStart { get; set; } = true;     // agent: 起動時 (ログオン時) に 1Password → キャッシュを同期する
+    public bool NotifyOnFill { get; set; } = true;    // agent: 認証ダイアログに自動入力したらトレイ通知を出す
+
+    /// <summary>
+    /// 認証キャッシュ (%APPDATA%\Subversion) にパスワードを保存するか。
+    /// keep: 保存する (TortoiseSVN の svn.exe も使える) / none: 保存しない (GUI は毎回自動入力) / 空: 未選択 (初回に聞く)
+    /// </summary>
+    public string CacheMode { get; set; } = "";
+    /// <summary>keep のとき、agent の起動時 (ログオン時) に 1Password → キャッシュを同期する</summary>
+    public bool SyncOnStart { get; set; } = true;
+    /// <summary>表示言語: auto (Windows の表示言語) / ja / en。環境変数 SVNOP_LANG が優先</summary>
+    public string Language { get; set; } = "auto";
+
+    public const string Keep = "keep";
+    public const string NoCache = "none";
+
+    public bool KeepCache => CacheMode == Keep;
+    public bool CacheModeChosen => CacheMode is Keep or NoCache;
 
     public static string Dir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "svnop");
@@ -29,8 +44,60 @@ public sealed class Config
     {
         if (!File.Exists(FilePath))
             return new Config();
-        return JsonSerializer.Deserialize<Config>(File.ReadAllText(FilePath), JsonOpt) ?? new Config();
+        try
+        {
+            return JsonSerializer.Deserialize<Config>(File.ReadAllText(FilePath), JsonOpt) ?? new Config();
+        }
+        catch (JsonException e)
+        {
+            throw new SvnOpException($"{FilePath}: {e.Message}");
+        }
     }
+
+    /// <summary>キー名 (camelCase) で値を設定する。svnop config / トレイから使う</summary>
+    public void Set(string key, string value)
+    {
+        bool Bool() => value.ToLowerInvariant() switch
+        {
+            "true" or "yes" or "on" or "1" => true,
+            "false" or "no" or "off" or "0" => false,
+            _ => throw new SvnOpException(L.T($"true / false で指定してください: {value}", $"use true / false: {value}")),
+        };
+        switch (key)
+        {
+            case "vault": Vault = value; break;
+            case "op": Op = value; break;
+            case "tag": Tag = value; break;
+            case "autoSubmit": AutoSubmit = Bool(); break;
+            case "notifyOnFill": NotifyOnFill = Bool(); break;
+            case "syncOnStart": SyncOnStart = Bool(); break;
+            case "cacheMode":
+                CacheMode = value is Keep or NoCache ? value
+                    : throw new SvnOpException(L.T("keep か none で指定してください", "use keep or none"));
+                break;
+            case "language":
+                Language = value is "auto" or "ja" or "en" ? value
+                    : throw new SvnOpException(L.T("auto / ja / en で指定してください", "use auto / ja / en"));
+                break;
+            default:
+                throw new SvnOpException(L.T("不明な設定です: ", "unknown setting: ") + key);
+        }
+    }
+
+    public static readonly string[] Keys = ["cacheMode", "syncOnStart", "vault", "language", "notifyOnFill", "autoSubmit", "op", "tag"];
+
+    public string Get(string key) => key switch
+    {
+        "vault" => Vault,
+        "op" => Op,
+        "tag" => Tag,
+        "autoSubmit" => AutoSubmit ? "true" : "false",
+        "notifyOnFill" => NotifyOnFill ? "true" : "false",
+        "syncOnStart" => SyncOnStart ? "true" : "false",
+        "cacheMode" => CacheMode,
+        "language" => Language,
+        _ => throw new SvnOpException(L.T("不明な設定です: ", "unknown setting: ") + key),
+    };
 
     public void Save()
     {

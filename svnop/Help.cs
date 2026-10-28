@@ -17,6 +17,7 @@ static class Help
           setup tortoisesvn     TortoiseSVN / svn.exe 向けの設定 (ボールト指定・自動起動・常駐開始)
           setup msys2           msys2 の svn 向けの設定 (gpg-agent と pinentry)
           setup --remove ...    上記の設定を外す
+          config [キー [値]]    設定を表示 / 変更する (認証キャッシュの方針・表示言語など)
 
         1Password への登録
           realm <URL>...        URL の realm (認証の単位) を調べる
@@ -45,7 +46,7 @@ static class Help
         共通オプション
           --auth-dir DIR        svn.simple の場所 (既定: %APPDATA%\Subversion\auth\svn.simple)
 
-        設定ファイル: %APPDATA%\svnop\config.json   表示言語: 環境変数 SVNOP_LANG=ja|en
+        設定ファイル: %APPDATA%\svnop\config.json   表示言語: svnop config language ja|en|auto (環境変数 SVNOP_LANG が優先)
         """,
         $$"""
         svnop {{Version}} - manage Subversion credentials with 1Password
@@ -57,6 +58,7 @@ static class Help
           setup tortoisesvn     set up for TortoiseSVN / svn.exe (vault, autostart, start the agent)
           setup msys2           set up for msys2 svn (gpg-agent and pinentry)
           setup --remove ...    undo the setup above
+          config [key [value]]  show / change settings (credential cache mode, language, ...)
 
         Registering in 1Password
           realm <URL>...        find the realm (authentication scope) of a URL
@@ -85,23 +87,31 @@ static class Help
         Common options
           --auth-dir DIR        location of svn.simple (default: %APPDATA%\Subversion\auth\svn.simple)
 
-        Config file: %APPDATA%\svnop\config.json   Language: environment variable SVNOP_LANG=ja|en
+        Config file: %APPDATA%\svnop\config.json   Language: svnop config language ja|en|auto (SVNOP_LANG overrides)
         """);
 
     static readonly Dictionary<string, (string Ja, string En)> Commands = new()
     {
         ["setup"] = (
             """
-            svnop setup tortoisesvn [--vault V] [--no-autostart] [--dry-run]
+            svnop setup tortoisesvn [--vault V] [--cache keep|none] [--sync-on-start true|false]
+                                    [--language auto|ja|en] [--no-autostart] [--dry-run]
             svnop setup msys2 [--msys-root DIR] [--dry-run]
             svnop setup --remove tortoisesvn|msys2 [--dry-run]
 
             tortoisesvn
-              - config.json に 1Password のボールトを記録する (--vault。省略時は今の設定のまま)
+              - 指定した設定を config.json に記録する (省略したものは今の設定のまま)
+                  --vault          1Password のボールト
+                  --cache          認証キャッシュにパスワードを保存するか
+                                   keep: 保存する。TortoiseSVN もコマンドライン版 svn.exe もキャッシュで認証する
+                                   none: 保存しない。TortoiseSVN は毎回自動入力、svn.exe は毎回パスワードを聞かれる
+                                   (未選択でコンソールから実行した場合はその場で聞く。それ以外は agent の初回起動時に聞く)
+                  --sync-on-start  keep のとき、ログオン時に 1Password からキャッシュを同期するか
+                  --language       表示言語
               - 1Password CLI (op) が使えるか、ボールトがあるかを確かめる
               - ログオン時に agent (svnopw.exe) が起動するよう登録する (HKCU\...\Run)
               - agent を起動する
-              続けて「svnop import」で既存のキャッシュを取り込むか、「svnop sync」で書き出してください。
+              続けて「svnop import --adopt」で既存のキャッシュを取り込んでください。
 
             msys2
               msys2 の svn (pacman -S subversion) を 1Password と連携させます。
@@ -115,16 +125,24 @@ static class Help
             --dry-run 変更内容を表示するだけで、何も変更しません
             """,
             """
-            svnop setup tortoisesvn [--vault V] [--no-autostart] [--dry-run]
+            svnop setup tortoisesvn [--vault V] [--cache keep|none] [--sync-on-start true|false]
+                                    [--language auto|ja|en] [--no-autostart] [--dry-run]
             svnop setup msys2 [--msys-root DIR] [--dry-run]
             svnop setup --remove tortoisesvn|msys2 [--dry-run]
 
             tortoisesvn
-              - stores the 1Password vault in config.json (--vault; unchanged if omitted)
+              - stores the given settings in config.json (omitted ones stay as they are)
+                  --vault          the 1Password vault
+                  --cache          whether to save passwords in the credential cache
+                                   keep: save. Both TortoiseSVN and the command-line svn.exe authenticate from the cache
+                                   none: do not save. TortoiseSVN is auto-filled every time; svn.exe asks every time
+                                   (if not chosen yet, asked on the console when run interactively, otherwise by the agent at first start)
+                  --sync-on-start  with keep, sync the cache from 1Password at logon
+                  --language       display language
               - checks that the 1Password CLI (op) works and the vault exists
               - registers the agent (svnopw.exe) to start at logon (HKCU\...\Run)
               - starts the agent
-              Then run "svnop import" to import existing cache entries, or "svnop sync" to write them out.
+              Then run "svnop import --adopt" to import existing cache entries.
 
             msys2
               Connects msys2 svn (pacman -S subversion) with 1Password.
@@ -136,6 +154,35 @@ static class Help
 
             --remove  undoes the changes above (1Password and cache contents are left alone)
             --dry-run only prints what would change
+            """),
+        ["config"] = (
+            """
+            svnop config                 設定を一覧表示する
+            svnop config <キー>          値を表示する
+            svnop config <キー> <値>     値を変更する
+
+            主なキー
+              cacheMode     keep (認証キャッシュに保存する) / none (保存しない)
+              syncOnStart   true / false   keep のとき、ログオン時に 1Password から同期する
+              vault         1Password のボールト
+              language      auto / ja / en   表示言語 (環境変数 SVNOP_LANG が優先)
+              notifyOnFill  true / false   自動入力したら通知する
+              autoSubmit    true / false   自動入力の後に OK を押す
+            トレイメニューの「設定」からも変更できます。
+            """,
+            """
+            svnop config                 list settings
+            svnop config <key>           show a value
+            svnop config <key> <value>   change a value
+
+            Main keys
+              cacheMode     keep (save in the credential cache) / none (do not save)
+              syncOnStart   true / false   with keep, sync from 1Password at logon
+              vault         the 1Password vault
+              language      auto / ja / en   display language (SVNOP_LANG overrides)
+              notifyOnFill  true / false   notify when auto-filled
+              autoSubmit    true / false   press OK after auto-fill
+            These can also be changed from Settings in the tray menu.
             """),
         ["realm"] = (
             """
@@ -205,7 +252,8 @@ static class Help
             1Password のタグ svn のアイテムを、TortoiseSVN / svn.exe のキャッシュ (wincrypt 形式) に書き出します。
             1Password と同じ内容のものは書き換えません。svnop が書いた後に変更されたものや、
             svnop の管理外で内容の違うものは --force を付けない限り触りません。
-            agent は起動時 (ログオン時) に自動で sync します。
+            認証キャッシュを保存しない設定 (cacheMode none) のときは実行しません (--force で実行)。
+            保存する設定で syncOnStart が有効なら、agent が起動時 (ログオン時) に自動で sync します。
             """,
             """
             svnop sync [--force] [--dry-run]
@@ -213,7 +261,8 @@ static class Help
             Writes 1Password items tagged svn into the TortoiseSVN / svn.exe cache (wincrypt format).
             Entries identical to 1Password are left as they are. Entries changed after svnop wrote them,
             or unmanaged entries with different values, are not touched unless --force is given.
-            The agent syncs automatically when it starts (at logon).
+            Refused when the cache mode is "none" (use --force to run anyway).
+            With cache mode "keep" and syncOnStart, the agent syncs automatically when it starts (at logon).
             """),
         ["lock"] = (
             "svnop lock [--force]\n\nsvnop が書いた (管理下の) キャッシュを消します。書いた後に変更されたものは --force を付けない限り残します。\n戻すときは svnop sync。",
@@ -232,9 +281,10 @@ static class Help
               - TortoiseSVN の認証ダイアログに 1Password の値を入れて OK を押す
               - 1Password に無い / 1Password の値で失敗したときは入力ウインドウを出し、1Password に記録する
               - svn.exe などがキャッシュに保存した新しい認証情報を、確認のうえ 1Password に記録する
-              - 起動時に 1Password → キャッシュを同期する (config.json の syncOnStart)
+              - 認証キャッシュを保存する設定なら、起動時に 1Password → キャッシュを同期する (syncOnStart)
+              - 初回起動時、認証キャッシュの方針が未選択なら選択画面を出す
               - msys2 の pinentry からの問い合わせに答える (1Password の承認が 10 分に 1 回程度で済む)
-            トレイアイコンのメニューから sync / lock / ログ表示 / 終了ができます。
+            トレイアイコンのメニューから sync / lock / 設定 / ヘルプ (README) / ログ表示 / 終了ができます。
             """,
             """
             svnop agent [--stop | --status]
@@ -243,9 +293,10 @@ static class Help
               - fills TortoiseSVN auth dialogs with values from 1Password and presses OK
               - shows its own input window when 1Password has no entry or the stored value fails, and records the input
               - records new credentials that svn.exe etc. saved to the cache into 1Password (after asking)
-              - syncs 1Password to the cache at startup (syncOnStart in config.json)
+              - syncs 1Password to the cache at startup when the cache mode is "keep" (syncOnStart)
+              - asks for the credential cache mode at first start if it has not been chosen
               - answers the msys2 pinentry (1Password approval is needed only about once per 10 minutes)
-            The tray icon menu offers sync / lock / show log / exit.
+            The tray icon menu offers sync / lock / settings / help (README) / show log / exit.
             """),
         ["gpg-init"] = (
             "svnop gpg-init --auth-dir DIR [--dry-run]\n\n1Password の各 realm について、msys2 の svn 用にユーザー名だけのキャッシュ (passtype=gpg-agent) を作ります。\n既存のファイルには触れません。通常は svnop setup msys2 が実行します。",
