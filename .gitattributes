@@ -1,0 +1,7 @@
+* text=auto
+# msys2 から実行するので LF 固定 (CRLF だと shebang が読めない)
+*.py text eol=lf
+*.sh text eol=lf
+# Windows のツールで読むもの
+*.ps1 text eol=crlf
+*.iss text eol=crlf

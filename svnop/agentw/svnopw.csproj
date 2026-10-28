@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 常駐用 (コンソールなし)。ログオン時の自動起動はこちらを使う。ソースは親ディレクトリと共有 -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <RootNamespace>SvnOp</RootNamespace>
+    <AssemblyName>svnopw</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../*.cs" Exclude="../Program.cs;../Setup.cs;../Help.cs" />
+  </ItemGroup>
+
+</Project>
