@@ -1,7 +1,7 @@
 <Project>
   <!-- svnop / svnopw 共通のバージョン。インストーラ (installer/build.ps1) もここから読む -->
   <PropertyGroup>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Product>svnop</Product>
     <Description>Subversion credentials with 1Password</Description>
   </PropertyGroup>

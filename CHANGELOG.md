@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-10-28
+
+**Download / ダウンロード**: `svnop-setup-0.2.0.exe` (installer / インストーラ) or `svnop-0.2.0-win-x64.zip`.
+When upgrading from 0.1.0, the agent asks for the credential cache mode once (or choose it in the installer).
+/ 0.1.0 からの更新では、agent が一度だけ認証キャッシュの方針を聞きます (インストーラで選んだ場合は聞きません)。
 
 - **Credential cache mode** (`cacheMode`: `keep` / `none`) replaces `saveAuth`. It is chosen in the installer
   (or at the agent's first start), and `syncOnStart` applies only with `keep`
