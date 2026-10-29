@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.3.0] - 2026-10-29
+
+**Download / ダウンロード**: `svnop-setup-0.3.0.exe` (installer / インストーラ) or `svnop-0.3.0-win-x64.zip`.
+
+Security fixes from an audit / セキュリティ監査を受けた修正
+
+Behavior changes / 動作の変更:
+- `svnop realm` / `add` / `find` verify https certificates; add `--insecure` for servers with self-signed certificates
+  / https の証明書を検証するようになった。自己署名証明書のサーバでは `--insecure` を付ける
+- Recording a password from msys2 svn through the agent now asks for confirmation in the agent
+  / msys2 の svn から agent 経由で 1Password に記録するとき、agent が確認を出す
+
+- Named pipe: the client verifies that the server is an svnop executable of the same user in the same folder before sending
+  or receiving passwords; the agent refuses a pre-existing pipe of the same name, denies network clients, accepts concurrent
+  connections with size and time limits, and asks before recording (save). New setting `allowPipe`
+  / 名前付きパイプ: クライアントはパスワードの送受信前に、相手が同じユーザー・同じフォルダの svnop であることを確認する。agent は先に作られた
+  同名パイプを使わず、ネットワーク経由の接続を拒否し、同時接続と大きさ・時間の上限を設け、記録 (save) の前に確認する。設定 `allowPipe` を追加
+- op.exe is used only with a valid AgileBits signature; configured paths must be absolute
+  / op.exe は AgileBits の正しい署名があるものだけを使い、設定する場合は絶対パスに限る
+- Auto-fill only for specific, validly signed TortoiseSVN executables; the dialog is re-checked right before filling
+  / 自動入力は、署名された決まった TortoiseSVN の exe だけを対象にし、入力直前にダイアログを再確認する
+- Realm probing verifies https certificates (`--insecure` for self-signed servers) and limits svn:// responses
+  / realm の調査で https の証明書を検証する (自己署名は `--insecure`)。svn:// の応答に上限を設けた
+- Cache: plain-text entries are re-encrypted; sync / lock / mode changes are serialized and an in-flight sync is cancelled by lock;
+  `import --adopt` only adopts entries confirmed to match 1Password; lock only deletes files named after their realm;
+  cache files and config.json are validated
+  / キャッシュ: 平文を暗号化し直す。sync・lock・方針変更を排他し、lock で取得中の同期を取り消す。`import --adopt` は 1Password と
+  一致を確認したものだけを管理下に置く。lock は realm から決まる名前のファイルだけを消す。キャッシュファイルと config.json を検証する
+- setup msys2: paths are quoted for bash; broken markers stop the change; removal restores only the original pinentry line
+  and does nothing when svnop was not set up
+  / setup msys2: パスを bash 用に引用する。マーカーが壊れていれば変更しない。解除は元の pinentry 行だけを戻し、設定していなければ何もしない
+- pinentry: relays Assuan INQUIRE, decodes data as bytes, joins multiple data lines
+  / pinentry: INQUIRE を中継し、データをバイト単位で復号し、複数のデータ行をつなげる
+- CI: actions pinned to commit SHAs, Inno Setup version pinned, write permission only for the release job, tag names passed via environment variables
+  / CI: Actions をコミット SHA で固定、Inno Setup のバージョンを固定、書き込み権限は release ジョブだけ、タグ名は環境変数で渡す
+- Native buffers with decrypted data are cleared; log lines escape control characters; op error output is truncated
+  / 復号したネイティブのバッファを消去。ログの制御文字をエスケープ。op のエラー出力を切り詰める
+
 ## [0.2.1] - 2026-10-28
 
 **Download / ダウンロード**: `svnop-setup-0.2.1.exe` (installer / インストーラ) or `svnop-0.2.1-win-x64.zip`.

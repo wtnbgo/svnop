@@ -19,6 +19,41 @@ public static class AuthCache
     public static string FileFor(string realm) =>
         Path.Combine(SimpleDir, Convert.ToHexStringLower(MD5.HashData(Encoding.UTF8.GetBytes(realm))));
 
+    /// <summary>キャッシュ 1 ファイルの大きさの上限 (これを超えるものは壊れているとみなして読まない)</summary>
+    const int MaxCacheFileBytes = 256 * 1024;
+
+    /// <summary>
+    /// file が「realm から計算したキャッシュファイル」(SimpleDir 直下、名前は realm の MD5) そのものか。
+    /// managed.json の内容を信用して任意のパスを消さないための確認
+    /// </summary>
+    public static bool IsCacheFileFor(string file, string realm)
+    {
+        try
+        {
+            if (!string.Equals(Path.GetFullPath(file), Path.GetFullPath(FileFor(realm)), StringComparison.OrdinalIgnoreCase))
+                return false;
+            return !File.Exists(file) || !File.GetAttributes(file).HasFlag(FileAttributes.ReparsePoint);
+        }
+        catch (Exception e) when (e is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>file が今のキャッシュの場所 (SimpleDir) の直下か</summary>
+    public static bool InCurrentDir(string file)
+    {
+        try
+        {
+            return string.Equals(Path.GetDirectoryName(Path.GetFullPath(file)), Path.GetFullPath(SimpleDir).TrimEnd(Path.DirectorySeparatorChar),
+                                 StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
     public static IEnumerable<CacheEntry> ReadAll(bool withPassword = false)
     {
         if (!Directory.Exists(SimpleDir))
@@ -26,8 +61,14 @@ public static class AuthCache
         foreach (var file in Directory.EnumerateFiles(SimpleDir))
         {
             Dictionary<string, string> h;
-            try { h = ReadHash(File.ReadAllBytes(file)); }
-            catch (FormatException) { continue; }
+            try
+            {
+                var info = new FileInfo(file);
+                if (info.Length > MaxCacheFileBytes || info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                    continue;
+                h = ReadHash(File.ReadAllBytes(file));
+            }
+            catch (Exception e) when (e is FormatException or IOException or UnauthorizedAccessException) { continue; }
             if (!h.TryGetValue("svn:realmstring", out var realm))
                 continue;
             var passType = h.GetValueOrDefault("passtype");
@@ -80,7 +121,10 @@ public static class AuthCache
 
     public static string HashOf(byte[] data) => Convert.ToHexStringLower(SHA256.HashData(data));
 
-    /// <summary>"K len\nkey\nV len\nvalue\n" の繰り返しと "END\n"</summary>
+    /// <summary>
+    /// "K len\nkey\nV len\nvalue\n" の繰り返しと "END\n"。
+    /// 長さは 0 以上で残りのバイト数以内、値の後ろは改行、最後は END、を確かめ、外れていれば FormatException
+    /// </summary>
     public static Dictionary<string, string> ReadHash(byte[] data)
     {
         var result = new Dictionary<string, string>();
@@ -88,7 +132,7 @@ public static class AuthCache
         string Line()
         {
             var nl = Array.IndexOf(data, (byte)'\n', pos);
-            if (nl < 0) throw new FormatException();
+            if (nl < 0) throw new FormatException("missing newline");
             var s = Encoding.UTF8.GetString(data, pos, nl - pos);
             pos = nl + 1;
             return s;
@@ -96,21 +140,30 @@ public static class AuthCache
         string Chunk(char tag)
         {
             var head = Line();
-            if (head.Length < 3 || head[0] != tag || head[1] != ' ') throw new FormatException();
-            var len = int.Parse(head[2..]);
-            if (pos + len > data.Length) throw new FormatException();
+            if (head.Length < 3 || head[0] != tag || head[1] != ' ')
+                throw new FormatException("bad header");
+            if (!int.TryParse(head.AsSpan(2), System.Globalization.NumberStyles.None,
+                              System.Globalization.CultureInfo.InvariantCulture, out var len))
+                throw new FormatException("bad length");
+            if (len > data.Length - pos - 1 || data[pos + len] != (byte)'\n')
+                throw new FormatException("bad value");
             var s = Encoding.UTF8.GetString(data, pos, len);
             pos += len + 1;
             return s;
         }
-        while (pos < data.Length)
+        while (true)
         {
-            if (data[pos] == 'E')
-                break;
+            if (pos >= data.Length)
+                throw new FormatException("missing END");
+            if (data[pos] == (byte)'E')
+            {
+                if (Line() != "END")
+                    throw new FormatException("bad END");
+                return result;
+            }
             var k = Chunk('K');
             result[k] = Chunk('V');
         }
-        return result;
     }
 
     static byte[] WriteHash(IEnumerable<KeyValuePair<string, string>> h)
@@ -142,18 +195,33 @@ public sealed class ManagedList
 
     public Dictionary<string, Entry> Files { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 読み込み。今のキャッシュの場所で「realm から計算したファイル名」と一致する項目だけを使う
+    /// (管理記録を細工されても、キャッシュ以外のファイルを消さないため。別の場所の記録はそのまま保存し直す)
+    /// </summary>
     public static ManagedList Load()
     {
+        Dictionary<string, Entry>? files;
         try
         {
-            var files = JsonSerializer.Deserialize<Dictionary<string, Entry>>(File.ReadAllText(PathOf));
-            return new ManagedList { Files = new(files ?? [], StringComparer.OrdinalIgnoreCase) };
+            files = JsonSerializer.Deserialize<Dictionary<string, Entry>>(File.ReadAllText(PathOf));
         }
         catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException or JsonException)
         {
             return new ManagedList();
         }
+        var list = new ManagedList();
+        foreach (var (file, e) in files ?? [])
+        {
+            if (e is { Realm: { Length: > 0 }, User: not null, Hash: { Length: 64 } })
+                list.Files[file] = e;
+        }
+        return list;
     }
+
+    /// <summary>今のキャッシュの場所にある、正しい名前のファイルの項目だけ</summary>
+    public IEnumerable<KeyValuePair<string, Entry>> Valid() =>
+        Files.Where(kv => AuthCache.IsCacheFileFor(kv.Key, kv.Value.Realm));
 
     public void Save()
     {

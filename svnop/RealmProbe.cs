@@ -13,12 +13,17 @@ public sealed record ProbeResult(string? Realm, string Note);
 /// </summary>
 public static class RealmProbe
 {
-    public static async Task<ProbeResult> ProbeAsync(string url)
+    /// <summary>realm 文字列の長さの上限 (これより長い応答は不正とみなす)</summary>
+    const int MaxRealmLength = 1024;
+    static readonly TimeSpan Deadline = TimeSpan.FromSeconds(15);
+
+    /// <param name="insecure">https の証明書を検証しない (自己署名証明書のサーバ用。偽の realm を返されるおそれがある)</param>
+    public static async Task<ProbeResult> ProbeAsync(string url, bool insecure = false)
     {
         var uri = new Uri(url);
         return uri.Scheme switch
         {
-            "http" or "https" => await ProbeHttpAsync(uri),
+            "http" or "https" => await ProbeHttpAsync(uri, insecure),
             "svn" => await ProbeSvnAsync(uri),
             "svn+ssh" => new ProbeResult(null, L.T("svn+ssh は ssh 側で認証するため対象外です", "svn+ssh authenticates through ssh; not handled")),
             _ => new ProbeResult(null, L.T("未対応のスキームです: ", "unsupported scheme: ") + uri.Scheme),
@@ -32,16 +37,18 @@ public static class RealmProbe
 
     // ---- http / https ----
 
-    static async Task<ProbeResult> ProbeHttpAsync(Uri uri)
+    static async Task<ProbeResult> ProbeHttpAsync(Uri uri, bool insecure)
     {
         using var handler = new HttpClientHandler
         {
             AllowAutoRedirect = false,
             UseDefaultCredentials = false,
-            // 認証情報は送らないので、自己署名証明書のサーバでも realm だけは調べられるようにする
-            ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
         };
-        using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
+        // 既定では証明書を検証する (偽のサーバに偽の realm を返されないように)。
+        // 自己署名証明書のサーバは --insecure を明示したときだけ受け入れる (認証情報は送らない)
+        if (insecure)
+            handler.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
+        using var http = new HttpClient(handler) { Timeout = Deadline };
         http.DefaultRequestHeaders.UserAgent.ParseAdd("SVN/1.14 svnop");
 
         // 読み取りは匿名可で書き込みだけ認証のサーバもあるので、OPTIONS → PROPFIND の順に試す
@@ -56,7 +63,18 @@ public static class RealmProbe
                     "<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop><resourcetype/></prop></propfind>",
                     Encoding.UTF8, "text/xml");
             }
-            using var res = await http.SendAsync(req);
+            HttpResponseMessage res;
+            try
+            {
+                // 必要なのはヘッダだけなので本文は読まない
+                res = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+            }
+            catch (HttpRequestException e) when (e.InnerException is System.Security.Authentication.AuthenticationException)
+            {
+                throw new SvnOpException(L.T("サーバの証明書を検証できません。自己署名証明書のサーバなら --insecure を付けてください",
+                                             "cannot verify the server certificate. For a server with a self-signed certificate, add --insecure"));
+            }
+            using var _ = res;
             if ((int)res.StatusCode is >= 300 and < 400)
                 return new ProbeResult(null, L.T("リダイレクトされました", "redirected") + $" ({(int)res.StatusCode}): {res.Headers.Location}");
             if (res.StatusCode != HttpStatusCode.Unauthorized)
@@ -70,6 +88,8 @@ public static class RealmProbe
                     h.Scheme.Equals("Digest", StringComparison.OrdinalIgnoreCase))
                 {
                     var realm = ParseRealm(h.Parameter);
+                    if (realm is { Length: > MaxRealmLength })
+                        throw new SvnOpException(L.T("realm が長すぎます", "the realm is too long"));
                     if (realm != null)
                         return new ProbeResult($"{Prefix(uri)} {realm}", L.T($"{h.Scheme} 認証 ({method.Method} で検出)", $"{h.Scheme} authentication (found with {method.Method})"));
                 }
@@ -113,11 +133,13 @@ public static class RealmProbe
     static async Task<ProbeResult> ProbeSvnAsync(Uri uri)
     {
         using var tcp = new TcpClient();
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var deadline = DateTime.UtcNow + Deadline;  // 接続から解析完了までの期限
+        using var cts = new CancellationTokenSource(Deadline);
         await tcp.ConnectAsync(uri.Host, Port(uri), cts.Token);
-        tcp.ReceiveTimeout = 15000;
+        tcp.ReceiveTimeout = tcp.SendTimeout = (int)Deadline.TotalMilliseconds;
         using var stream = tcp.GetStream();
-        var reader = new RaSvnReader(stream);
+        // 読み込みだけバッファする (BufferedStream は読み書きを混ぜられない)
+        var reader = new RaSvnReader(new BufferedStream(stream), deadline);
 
         // greeting: ( success ( minver maxver ( mechs ) ( caps ) ) )
         var greeting = reader.ReadItem() as List<object>;
@@ -137,6 +159,8 @@ public static class RealmProbe
         var auth = reader.ReadItem() as List<object>;
         if (auth is ["success", List<object> body] && body is [List<object> mechs, byte[] realm, ..])
         {
+            if (realm.Length > MaxRealmLength)
+                throw new SvnOpException(L.T("realm が長すぎます", "the realm is too long"));
             var names = mechs.OfType<string>().ToList();
             var realmString = $"{Prefix(uri)} {Encoding.UTF8.GetString(realm)}";
             if (names.Count == 0)
@@ -150,14 +174,30 @@ public static class RealmProbe
         return new ProbeResult(null, L.T("svnserve の応答が想定外です", "unexpected response from svnserve"));
     }
 
-    /// <summary>ra_svn のデータ項目 (word / number / "len:bytes" / リスト) を読む最小実装</summary>
-    sealed class RaSvnReader(Stream s)
+    /// <summary>
+    /// ra_svn のデータ項目 (word / number / "len:bytes" / リスト) を読む最小実装。
+    /// 悪意のあるサーバで止まったり落ちたりしないよう、総受信量・文字列長・要素数・深さ・期限に上限を設ける
+    /// </summary>
+    sealed class RaSvnReader(Stream s, DateTime deadline)
     {
+        const int MaxTotalBytes = 64 * 1024;
+        const int MaxStringBytes = 8 * 1024;
+        const int MaxWordLength = 64;
+        const int MaxListItems = 256;
+        const int MaxDepth = 16;
+
         int _peek = -1;
+        int _total;
+
+        static SvnOpException Bad() => new(L.T("svnserve の応答が不正です", "invalid response from svnserve"));
 
         int Next()
         {
             if (_peek >= 0) { var c = _peek; _peek = -1; return c; }
+            if (DateTime.UtcNow > deadline)
+                throw new SvnOpException(L.T("svnserve の応答が時間内に終わりませんでした", "svnserve did not respond in time"));
+            if (++_total > MaxTotalBytes)
+                throw Bad();
             var b = s.ReadByte();
             return b < 0 ? throw new SvnOpException(L.T("svnserve との接続が切れました", "connection to svnserve was closed")) : b;
         }
@@ -169,8 +209,10 @@ public static class RealmProbe
             return c;
         }
 
-        public object ReadItem()
+        public object ReadItem(int depth = 0)
         {
+            if (depth > MaxDepth)
+                throw Bad();
             var c = SkipSpace();
             if (c == '(')
             {
@@ -180,32 +222,46 @@ public static class RealmProbe
                     var d = SkipSpace();
                     if (d == ')')
                         return list;
+                    if (list.Count >= MaxListItems)
+                        throw Bad();
                     _peek = d;
-                    list.Add(ReadItem());
+                    list.Add(ReadItem(depth + 1));
                 }
             }
             if (char.IsAsciiDigit((char)c))
             {
                 long n = c - '0';
                 while (char.IsAsciiDigit((char)(c = Next())))
+                {
                     n = n * 10 + (c - '0');
+                    if (n > int.MaxValue)
+                        throw Bad();
+                }
                 if (c != ':')
                 {
                     _peek = c;
                     return n;
                 }
+                if (n > MaxStringBytes)
+                    throw Bad();
                 var buf = new byte[n];
                 for (var i = 0; i < n; i++)
                     buf[i] = (byte)Next();
                 return buf;
             }
+            if (!char.IsAsciiLetter((char)c))
+                throw Bad();
             var sb = new StringBuilder();
             sb.Append((char)c);
             while (true)
             {
                 var d = Next();
                 if (char.IsAsciiLetterOrDigit((char)d) || d == '-')
+                {
+                    if (sb.Length >= MaxWordLength)
+                        throw Bad();
                     sb.Append((char)d);
+                }
                 else { _peek = d; break; }
             }
             return sb.ToString();

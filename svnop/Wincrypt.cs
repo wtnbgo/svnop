@@ -88,6 +88,8 @@ public static partial class Wincrypt
             }
             finally
             {
+                // 復号した平文が入っていたネイティブのバッファは、解放する前に消去する
+                ZeroMemory(output.pbData, output.cbData);
                 LocalFree(output.pbData);
                 LocalFree(descr);
             }
@@ -96,5 +98,12 @@ public static partial class Wincrypt
         {
             handle.Free();
         }
+    }
+
+    static void ZeroMemory(IntPtr p, int length)
+    {
+        if (p == IntPtr.Zero || length <= 0)
+            return;
+        unsafe { new Span<byte>((void*)p, length).Clear(); }
     }
 }

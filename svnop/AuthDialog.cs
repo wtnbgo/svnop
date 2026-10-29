@@ -25,9 +25,19 @@ public sealed partial class AuthDialog
         Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\TortoiseSVN", "Directory", null) as string
             ?? @"C:\Program Files\TortoiseSVN\", "bin") + Path.DirectorySeparatorChar;
 
-    /// <summary>偽のダイアログにパスワードを流し込まないよう、TortoiseSVN の bin にある exe のウインドウだけを対象にする</summary>
+    /// <summary>認証ダイアログを出す TortoiseSVN の exe</summary>
+    static readonly HashSet<string> TsvnExes = new(StringComparer.OrdinalIgnoreCase)
+        { "TortoiseProc.exe", "TortoiseMerge.exe", "TortoiseBlame.exe" };
+
+    /// <summary>
+    /// 偽のダイアログにパスワードを流し込まないよう、TortoiseSVN の bin にある決まった exe で、
+    /// 正しく署名されたもの (署名者 Stefan Kueng / TortoiseSVN) のウインドウだけを対象にする
+    /// </summary>
     public static bool IsTortoiseProcess(uint pid) =>
-        Win32.ImagePath(pid) is { } path && path.StartsWith(TsvnBinDir, StringComparison.OrdinalIgnoreCase);
+        Win32.ImagePath(pid) is { } path
+        && string.Equals(Path.GetDirectoryName(path) + Path.DirectorySeparatorChar, TsvnBinDir, StringComparison.OrdinalIgnoreCase)
+        && TsvnExes.Contains(Path.GetFileName(path))
+        && Trust.IsSignedBy(path, "Stefan Kueng", "TortoiseSVN");
 
     public static AuthDialog? TryDetect(IntPtr hwnd)
     {
@@ -71,6 +81,22 @@ public sealed partial class AuthDialog
 
     public static List<AuthDialog> FindAll() =>
         Win32.TopLevelWindows().Select(TryDetect).OfType<AuthDialog>().ToList();
+
+    /// <summary>
+    /// 入力の直前に、同じウインドウがまだ同じ認証ダイアログか (プロセス・realm・各コントロールが同じで、
+    /// コントロールがこのダイアログの子でプロセスも同じか) を確かめる。1Password の応答待ちの間に変わっていないか確認するため
+    /// </summary>
+    public bool StillValid()
+    {
+        if (!Win32.IsWindow(Hwnd) || TryDetect(Hwnd) is not { } now)
+            return false;
+        if (now.Pid != Pid || now.Realm != Realm || now.UserEdit != UserEdit || now.PassEdit != PassEdit || now.OkButton != OkButton)
+            return false;
+        foreach (var c in new[] { UserEdit, PassEdit, OkButton })
+            if (!Win32.IsChild(Hwnd, c) || Win32.ProcessId(c) != Pid)
+                return false;
+        return true;
+    }
 
     /// <summary>ユーザ名とパスワードを入れて OK を押す。saveAuth=false なら「認証情報を保存」を外す</summary>
     public void Fill(string user, string password, bool saveAuth, bool submit)

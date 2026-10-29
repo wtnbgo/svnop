@@ -193,6 +193,7 @@ Settings live in `%APPDATA%\svnop\config.json`. You can change them in three way
 | `language` | `auto` | Display language: `auto` (follow Windows) / `ja` / `en` |
 | `notifyOnFill` | `true` | Notify when an auth dialog is auto-filled |
 | `autoSubmit` | `true` | Press OK after auto-fill |
+| `allowPipe` | `true` | Answer requests from the msys2 pinentry (named pipe). Set to `false` if unused |
 | `op` | (auto-detected) | Location of `op.exe` |
 | `tag` | `svn` | Tag on the items |
 
@@ -271,10 +272,25 @@ msys2 svn   ──▶ gpg-agent ──▶ svn-op-pinentry ──▶ svnop call �
 
 ## Security
 
-- **Password handling**: svnop never puts passwords in logs or on command lines. Writes to 1Password pass the JSON on standard input.
-- **The cache with "Save"**: same format and strength as when TortoiseSVN saves passwords itself. If you do not want passwords left on a laptop, use "Do not save", or lock when you finish.
-- **Agent access**: while the 1Password approval is valid, the agent answers requests from processes of the same user. This is the same trust model as the gpg-agent cache.
+### Trust model
+
+- **Processes of the same user**: while the 1Password approval is valid, the agent answers password requests (named pipe) from processes of the same Windows user. This is the same trust model as the gpg-agent cache. Set `allowPipe` to `false` if you do not use it.
+- **Other users and the network**: only the same user can connect to the pipe, and connections over the network (SMB) are refused.
+- **Pipe impersonation**: before sending or receiving a password, the client (`svnop call`, used by the pinentry) checks that the other end is an svnop executable of the same user in the same folder. The agent does not use the pipe if another process created a pipe with the same name first.
+- **Confirming writes**: the agent asks every time before recording a password in 1Password through the pipe (save).
 - **Dedicated vault**: a separate vault for SVN limits what op can reach, and can be shared with a team.
+
+### Implementation safeguards
+
+- **Password handling**: passwords never go into logs, command lines or temporary files. Writes to 1Password pass the JSON on standard input. Control characters in logs are escaped, and only the first line of op's error output is used, truncated.
+- **Checking op.exe**: only an op.exe with a valid AgileBits signature is used, and a configured path must be absolute.
+- **What gets auto-filled**: only authentication dialogs from specific, validly signed TortoiseSVN executables (such as TortoiseProc) in the TortoiseSVN install folder. The dialog is checked again right before filling.
+- **Realm probing**: https certificates are verified (use `--insecure` explicitly for self-signed servers). svn:// responses are limited in size, depth and time.
+- **Cache**:
+  - With "Save", the cache has the same format and strength (DPAPI) as when TortoiseSVN saves passwords itself. Entries saved in plain text are re-encrypted when syncing.
+  - If you do not want passwords left on a laptop, use "Do not save", or lock when you finish.
+  - lock only deletes cache files written by svnop (named after their realm).
+- **Memory**: native buffers holding decrypted data are cleared before being freed. .NET strings cannot be cleared, so passwords being processed stay in memory for a while.
 
 ## Troubleshooting
 

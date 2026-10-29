@@ -146,6 +146,12 @@ static class Setup
             return;
         }
         Out("- op: " + op);
+        if (!Trust.IsSignedBy(op, "AgileBits"))
+        {
+            Warn(L.T("op.exe の署名を確認できません。1Password 公式の op.exe ではない可能性があるので、svnop は使いません",
+                     "cannot verify the signature of op.exe. It may not be the official 1Password CLI, so svnop will not use it"));
+            return;
+        }
         if (_dry)
             return;
         try
@@ -230,19 +236,29 @@ static class Setup
             throw new SvnOpException(L.T($"{pinentry} がありません", $"{pinentry} not found"));
         var cfg = Config.Load();
 
-        // gpg-agent.conf: pinentry を差し替え、キャッシュ時間を足す (既存は一度だけ退避)
+        CheckPath(pinentry);
+        CheckPath(m.Root);
+        // 書き換える前に (--dry-run でも) マーカーの対応を確かめる
+        foreach (var f in new[] { Path.Combine(m.HomeWin, ".gnupg", "gpg-agent.conf"), Path.Combine(m.HomeWin, ".bashrc") })
+            CheckMarkers(ReadLines(f), f);
+
+        // gpg-agent.conf: pinentry を差し替え、キャッシュ時間を足す。
+        // 元の pinentry-program 行はファイル全体を退避する代わりに、svnop のブロック内にコメントで残す (解除時にその行だけ戻す)
         var gpgConf = Path.Combine(m.HomeWin, ".gnupg", "gpg-agent.conf");
         Do(L.T($"{gpgConf} の pinentry を svn-op-pinentry にする", $"point pinentry in {gpgConf} to svn-op-pinentry"), () =>
         {
             Directory.CreateDirectory(Path.GetDirectoryName(gpgConf)!);
-            var lines = ReadLines(gpgConf);
-            if (lines.Any(l => l.TrimStart().StartsWith("pinentry-program")) && !File.Exists(gpgConf + ".svnop-bak"))
-                File.Copy(gpgConf, gpgConf + ".svnop-bak");
-            lines = StripBlock(lines);
+            var all = ReadLines(gpgConf);
+            var originals = BlockLines(all, gpgConf).Where(l => l.StartsWith(OriginalMark)).ToList();
+            var lines = StripBlock(all, gpgConf);
+            originals.AddRange(lines.Where(l => l.TrimStart().StartsWith("pinentry-program")).Select(l => OriginalMark + l));
+            originals.AddRange(LegacyBackupOriginals(gpgConf, originals));
             // 以前の手作業の設定 (マーカー無し) も取り除く
             lines.RemoveAll(l => l.TrimStart().StartsWith("pinentry-program") || l.StartsWith("# svnop:")
                                  || l.Trim() is "default-cache-ttl 3600" or "max-cache-ttl 28800");
-            var block = new List<string> { Begin, $"pinentry-program {ToMsysPath(pinentry)}" };
+            var block = new List<string> { Begin };
+            block.AddRange(originals.Distinct());
+            block.Add($"pinentry-program {ToMsysPath(pinentry)}");
             if (!lines.Any(l => l.TrimStart().StartsWith("default-cache-ttl")))
                 block.Add("default-cache-ttl 3600");
             if (!lines.Any(l => l.TrimStart().StartsWith("max-cache-ttl")))
@@ -252,7 +268,8 @@ static class Setup
         });
 
         // pinentry の設定
-        var opPath = cfg.FindOp();
+        // 署名を確認できた op.exe だけを pinentry に教える
+        var opPath = cfg.FindOp() is { } found && Trust.IsSignedBy(found, "AgileBits") ? found : null;
         var svnopConf = Path.Combine(m.HomeWin, ".config", "svn-op", "config.json");
         Do(L.T($"{svnopConf} を作る", $"create {svnopConf}"), () =>
         {
@@ -273,13 +290,14 @@ static class Setup
         var rootSlash = m.Root.Replace('\\', '/').TrimEnd('/') + "/";
         Do(L.T($"{bashrc} に gpg-agent の起動を足す", $"add gpg-agent startup to {bashrc}"), () =>
         {
-            var lines = StripBlock(ReadLines(bashrc));
+            var lines = StripBlock(ReadLines(bashrc), bashrc);
             RemoveLegacyBashrc(lines);
             lines.AddRange([
                 Begin,
                 L.T("# msys2 の svn が gpg-agent (→ svnop → 1Password) を使えるよう、msys2 のシェルでだけ gpg-agent を起動する",
                     "# start gpg-agent (only in msys2 shells) so msys2 svn can use it (-> svnop -> 1Password)"),
-                $"if [ \"$(cygpath -m / 2>/dev/null)\" = \"{rootSlash}\" ]; then gpgconf --launch gpg-agent 2>/dev/null; fi",
+                // パスはシェルのコードとして解釈されないよう単一引用符で囲む
+                $"if [ \"$(cygpath -m / 2>/dev/null)\" = {BashQuote(rootSlash)} ]; then gpgconf --launch gpg-agent 2>/dev/null; fi",
                 End,
             ]);
             WriteLines(bashrc, lines);
@@ -318,23 +336,38 @@ static class Setup
         Out(L.T("msys2 の svn 向けの設定を外す", "Removing the msys2 svn setup"));
         var m = FindMsys(o);
         var gpgConf = Path.Combine(m.HomeWin, ".gnupg", "gpg-agent.conf");
-        if (File.Exists(gpgConf + ".svnop-bak"))
-            Do(L.T($"{gpgConf} を元に戻す", $"restore {gpgConf}"), () => File.Move(gpgConf + ".svnop-bak", gpgConf, overwrite: true));
-        else if (File.Exists(gpgConf))
-            Do(L.T($"{gpgConf} から svnop の設定を外す", $"remove the svnop settings from {gpgConf}"), () =>
+        var svnopConf = Path.Combine(m.HomeWin, ".config", "svn-op", "config.json");
+        var bashrc = Path.Combine(m.HomeWin, ".bashrc");
+
+        // svnop が設定していなければ何もしない (アンインストール時に、設定していない環境を触らないため)
+        bool HasOurs(string path) => ReadLines(path).Any(l => l.Trim() == Begin || l.StartsWith("# svnop:"));
+        if (!HasOurs(gpgConf) && !HasOurs(bashrc) && !File.Exists(svnopConf))
+        {
+            Out(L.T("- svnop の設定はありません", "- nothing set up by svnop"));
+            return 0;
+        }
+
+        if (File.Exists(gpgConf))
+            Do(L.T($"{gpgConf} から svnop の設定を外す (元の pinentry-program 行は戻す)",
+                   $"remove the svnop settings from {gpgConf} (the original pinentry-program line is restored)"), () =>
             {
-                var lines = StripBlock(ReadLines(gpgConf));
+                var all = ReadLines(gpgConf);
+                var originals = BlockLines(all, gpgConf).Where(l => l.StartsWith(OriginalMark))
+                    .Select(l => l[OriginalMark.Length..]).ToList();
+                var lines = StripBlock(all, gpgConf);
+                if (!lines.Any(l => l.TrimStart().StartsWith("pinentry-program")))
+                    lines.AddRange(originals);
                 if (lines.All(string.IsNullOrWhiteSpace)) File.Delete(gpgConf);
                 else WriteLines(gpgConf, lines);
+                if (File.Exists(gpgConf + ".svnop-bak"))
+                    File.Delete(gpgConf + ".svnop-bak");  // 旧版の退避ファイル (中の pinentry-program 行はブロックに移してある)
             });
-        var svnopConf = Path.Combine(m.HomeWin, ".config", "svn-op", "config.json");
         if (File.Exists(svnopConf))
             Do(L.T($"{svnopConf} を削除", $"delete {svnopConf}"), () => File.Delete(svnopConf));
-        var bashrc = Path.Combine(m.HomeWin, ".bashrc");
         if (File.Exists(bashrc))
             Do(L.T($"{bashrc} から svnop の行を外す", $"remove the svnop lines from {bashrc}"), () =>
             {
-                var lines = StripBlock(ReadLines(bashrc));
+                var lines = StripBlock(ReadLines(bashrc), bashrc);
                 RemoveLegacyBashrc(lines);
                 WriteLines(bashrc, lines);
             });
@@ -343,6 +376,28 @@ static class Setup
         Out(L.T("~/.subversion のユーザ名キャッシュ (passtype=gpg-agent) は残しています",
                 "Username cache entries in ~/.subversion (passtype=gpg-agent) are left in place."));
         return 0;
+    }
+
+    /// <summary>svnop のブロック内で、導入前の行を残しておく印</summary>
+    const string OriginalMark = "# svnop-original: ";
+
+    /// <summary>旧版が作った gpg-agent.conf.svnop-bak の pinentry-program 行 (まだブロックに無いものだけ)</summary>
+    static IEnumerable<string> LegacyBackupOriginals(string gpgConf, List<string> already)
+    {
+        var bak = gpgConf + ".svnop-bak";
+        if (!File.Exists(bak) || already.Count > 0)
+            return [];
+        return ReadLines(bak).Where(l => l.TrimStart().StartsWith("pinentry-program")).Select(l => OriginalMark + l).ToList();
+    }
+
+    /// <summary>bash の単一引用符で囲む (中の ' は '\'' にする)</summary>
+    static string BashQuote(string s) => "'" + s.Replace("'", "'\\''") + "'";
+
+    /// <summary>設定ファイルに書くパスに改行などの制御文字が無いことを確かめる</summary>
+    static void CheckPath(string path)
+    {
+        if (path.Any(char.IsControl))
+            throw new SvnOpException(L.T("パスに制御文字が含まれています: ", "the path contains control characters: ") + path);
     }
 
     /// <summary>1Password の各 realm について GPG-Agent 形式のキャッシュを作る (既存ファイルには触れない)</summary>
@@ -371,8 +426,36 @@ static class Setup
     static void WriteLines(string path, IEnumerable<string> lines) =>
         File.WriteAllText(path, string.Join("\n", lines).TrimStart('\n') + "\n", new UTF8Encoding(false));
 
-    static List<string> StripBlock(List<string> lines)
+    /// <summary>
+    /// マーカーの対応を確かめる。開始と終了が交互に現れ、最後が閉じていなければ例外 (壊れたファイルを書き換えないため)
+    /// </summary>
+    static void CheckMarkers(List<string> lines, string path)
     {
+        var inside = false;
+        foreach (var l in lines)
+        {
+            if (l.Trim() == Begin)
+            {
+                if (inside) throw Broken(path);
+                inside = true;
+            }
+            else if (l.Trim() == End)
+            {
+                if (!inside) throw Broken(path);
+                inside = false;
+            }
+        }
+        if (inside) throw Broken(path);
+    }
+
+    static SvnOpException Broken(string path) => new(L.T(
+        $"{path} の svnop のマーカー (# >>> svnop >>> / # <<< svnop <<<) の対応が崩れているので変更しません。手で直してから実行してください",
+        $"the svnop markers (# >>> svnop >>> / # <<< svnop <<<) in {path} do not match; not changing it. Fix it by hand and run again"));
+
+    /// <summary>svnop のブロックを取り除いた行</summary>
+    static List<string> StripBlock(List<string> lines, string path)
+    {
+        CheckMarkers(lines, path);
         var result = new List<string>();
         var inside = false;
         foreach (var l in lines)
@@ -383,6 +466,21 @@ static class Setup
         }
         while (result.Count > 0 && result[^1].Trim().Length == 0)
             result.RemoveAt(result.Count - 1);
+        return result;
+    }
+
+    /// <summary>svnop のブロックの中の行</summary>
+    static List<string> BlockLines(List<string> lines, string path)
+    {
+        CheckMarkers(lines, path);
+        var result = new List<string>();
+        var inside = false;
+        foreach (var l in lines)
+        {
+            if (l.Trim() == Begin) { inside = true; continue; }
+            if (l.Trim() == End) { inside = false; continue; }
+            if (inside) result.Add(l);
+        }
         return result;
     }
 

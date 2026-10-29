@@ -67,14 +67,27 @@ def T(ja, en):
 
 def log(msg):
     if CFG["log"]:
+        # 改行などの制御文字はエスケープする (realm やユーザ名でログの行を偽装されないように)
+        safe = "".join(c if c.isprintable() else "\\x%02x" % ord(c) for c in msg)
         with open(CFG["log"], "a", encoding="utf-8") as f:
-            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+            f.write(time.strftime("%H:%M:%S ") + safe + "\n")
 
 
 # ---- Assuan のエスケープ ----
 
 def unescape(s):
-    return re.sub(r"%([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), s)
+    """Assuan の %XX をバイトとして復号してから UTF-8 として解釈する (不正な UTF-8 は ValueError)"""
+    raw = s.encode("utf-8")
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        if raw[i] == 0x25 and i + 2 < len(raw) and re.fullmatch(rb"[0-9A-Fa-f]{2}", raw[i + 1:i + 3]):
+            out.append(int(raw[i + 1:i + 3], 16))
+            i += 3
+        else:
+            out.append(raw[i])
+            i += 1
+    return out.decode("utf-8")
 
 
 def escape_data(s):
@@ -91,6 +104,9 @@ class OpBackend:
         self.map_path = os.path.join(CONFIG_DIR, "realm-map.json")
 
     def _op(self, args, stdin=None):
+        # 探索パス上の偽の op.exe を使わないよう、絶対パスで指定されたものだけを使う (svnop setup msys2 が署名を確かめて書く)
+        if not os.path.isabs(self.cfg["op"]):
+            raise RuntimeError("op must be an absolute path (set by svnop setup msys2)")
         cmd = [self.cfg["op"]] + args
         if self.cfg["vault"]:
             cmd += ["--vault", self.cfg["vault"]]
@@ -264,14 +280,30 @@ class Fallback:
     def readline(self):
         return self.p.stdout.readline().rstrip("\n")
 
-    def transact(self, line):
-        """1 コマンド送って、OK/ERR までの応答行を全部返す"""
+    def send(self, line):
         self.p.stdin.write(line + "\n")
         self.p.stdin.flush()
+
+    def transact(self, line, emit=None, inquire=None):
+        """1 コマンド送って、OK/ERR までの応答行を返す。
+        emit を渡すと応答行をその場で渡す (中継用)。
+        fallback が INQUIRE で問い合わせてきたら inquire(行) に任せ、無ければ CAN で断る"""
+        self.send(line)
         out = []
         while True:
             r = self.readline()
-            out.append(r)
+            if r.startswith("INQUIRE"):
+                if emit:
+                    emit(r)
+                if inquire:
+                    inquire(r)
+                else:
+                    self.send("CAN")
+                continue
+            if emit:
+                emit(r)
+            else:
+                out.append(r)
             if r.startswith(("OK", "ERR")) or r == "":
                 return out
 
@@ -318,9 +350,15 @@ def ask_user(history, st, error=None):
         if error:
             fb.transact("SETERROR " + error)
         res = fb.transact("GETPIN")
-        pw = next((unescape(r[2:]) for r in res if r.startswith("D ")), None)
         ok = res[-1].startswith("OK")
-        return pw if ok else None, fb
+        # データは複数の D 行に分かれることがあるので、つなげてから復号する
+        data = "".join(r[2:] for r in res if r.startswith("D "))
+        try:
+            pw = unescape(data) if ok and data else None
+        except ValueError:
+            log("fallback returned invalid UTF-8; treated as cancelled")
+            pw = None
+        return pw, fb
     except Exception:
         fb.close()
         raise
@@ -361,7 +399,9 @@ def handle_getpin(history, st):
     try:
         if newpw is None:
             return ["ERR 83886179 Operation cancelled <Pinentry>"]
-        if (not CFG["confirm_save"]) or confirm(fb, realm, user):
+        # agent 経由のときは agent が記録の確認を出すので、ここでは聞かない
+        need_confirm = CFG["confirm_save"] and not isinstance(backend, AgentBackend)
+        if (not need_confirm) or confirm(fb, realm, user):
             try:
                 backend.save(item_id, realm, user, newpw)
                 log("saved realm=%s user=%s" % (realm, user))
@@ -370,6 +410,19 @@ def handle_getpin(history, st):
     finally:
         fb.close()
     return ["D " + escape_data(newpw), "OK"]
+
+
+def relay_inquire(fb):
+    """fallback の INQUIRE への gpg-agent の答え (D 行 ... END / CAN) をそのまま fallback に渡す"""
+    while True:
+        line = sys.stdin.readline()
+        if line == "":
+            fb.send("CAN")
+            return
+        line = line.rstrip("\n")
+        fb.send(line)
+        if line == "END" or line.startswith("CAN"):
+            return
 
 
 def main():
@@ -381,8 +434,7 @@ def main():
         line = raw.rstrip("\n")
         cmd, _, arg = line.partition(" ")
         if fb:
-            for r in fb.transact(line):
-                reply(r)
+            fb.transact(line, emit=reply, inquire=lambda _: relay_inquire(fb))
             if cmd == "BYE":
                 fb.p.wait(timeout=5)
                 return
@@ -407,7 +459,10 @@ def main():
                    "SETOK", "SETCANCEL", "SETNOTOK", "SETTIMEOUT", "SETQUALITYBAR",
                    "SETQUALITYBAR_TT", "SETREPEAT", "SETREPEATERROR", "SETGENPIN", "SETGENPIN_TT"):
             if cmd != "OPTION":
-                st[cmd] = unescape(arg)
+                try:
+                    st[cmd] = unescape(arg)
+                except ValueError:
+                    st[cmd] = arg  # 不正な符号化: svn の問い合わせとは判定されない
             history.append(line)
             reply("OK")
             continue
@@ -423,8 +478,7 @@ def main():
         fb = Fallback(CFG["fallback"])
         for h in history:
             fb.transact(h)
-        for r in fb.transact(line):
-            reply(r)
+        fb.transact(line, emit=reply, inquire=lambda _: relay_inquire(fb))
 
 
 if __name__ == "__main__":

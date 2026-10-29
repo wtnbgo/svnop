@@ -12,6 +12,7 @@ $root = Split-Path $PSScriptRoot
 if (-not $Version) {
     $Version = ([xml](Get-Content "$root\svnop\Directory.Build.props")).Project.PropertyGroup.Version
 }
+if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "invalid version: $Version" }
 $dist = Join-Path $root 'dist'
 $app = Join-Path $dist 'app'
 

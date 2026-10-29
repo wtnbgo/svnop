@@ -68,7 +68,18 @@ public sealed class OpClient(Config cfg)
     string RunOrThrow(IEnumerable<string> args, string? stdin = null, bool withVault = true)
     {
         var (output, err) = Run(args, stdin, withVault);
-        return output ?? throw new SvnOpException(L.T("op が失敗しました: ", "op failed: ") + err);
+        return output ?? throw new SvnOpException(L.T("op が失敗しました: ", "op failed: ") + Summarize(err));
+    }
+
+    /// <summary>
+    /// op のエラー出力は、ログや画面・パイプの応答に流れるので、最初の 1 行だけを長さを切って使う
+    /// (万一の秘密の混入や、制御文字によるログの偽装を避けるため)
+    /// </summary>
+    static string Summarize(string err)
+    {
+        var first = err.Split('\n', 2)[0].Trim();
+        first = new string(first.Where(c => !char.IsControl(c)).ToArray());
+        return first.Length > 200 ? first[..200] + "…" : first;
     }
 
     /// <summary>アクセスできるボールトの名前一覧</summary>

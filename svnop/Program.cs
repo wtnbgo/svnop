@@ -101,7 +101,7 @@ static class Program
         {
             try
             {
-                var r = await RealmProbe.ProbeAsync(url);
+                var r = await RealmProbe.ProbeAsync(url, o.Has("insecure"));
                 Console.WriteLine(url);
                 Console.WriteLine("  realm: " + (r.Realm ?? T("(なし)", "(none)")));
                 Console.WriteLine("  " + r.Note);
@@ -125,7 +125,7 @@ static class Program
             return given;
         if (target.StartsWith('<'))
             return target;
-        var r = await RealmProbe.ProbeAsync(target);
+        var r = await RealmProbe.ProbeAsync(target, o.Has("insecure"));
         Console.WriteLine("realm: " + (r.Realm ?? T("(なし)", "(none)")) + "  - " + r.Note);
         return r.Realm ?? throw new SvnOpException(T("realm を特定できませんでした (--realm で直接指定できます)",
                                                      "could not determine the realm (use --realm to specify it)"));
@@ -252,9 +252,13 @@ static class Program
         foreach (var e in selected)
         {
             var exists = registered.Contains((e.Realm, e.Username!));
+            // 1Password に保存した / 1Password と値が同じと確かめたものだけを管理下に置く
+            // (スキップしたものを管理下に置くと、ローカルにしかない新しいパスワードを lock で消すおそれがある)
+            var inSync = false;
             if (exists && !update)
             {
-                Console.WriteLine(T("スキップ (登録済み): ", "skipped (exists): ") + $"{e.Realm} ({e.Username})");
+                Console.WriteLine(T("スキップ (登録済み。値は比べていないので管理下には置きません): ",
+                                    "skipped (exists; values not compared, so not put under management): ") + $"{e.Realm} ({e.Username})");
             }
             else
             {
@@ -267,9 +271,10 @@ static class Program
                     if (existing != null) updated++; else created++;
                     Console.WriteLine((existing != null ? T("更新: ", "updated: ") : T("登録: ", "added: ")) + $"{e.Realm} ({e.Username})");
                 }
+                inSync = true;
             }
             // --adopt: 1Password と同じ内容のキャッシュとして svnop の管理下に置く (lock で消える)
-            if (managed != null)
+            if (managed != null && inSync && AuthCache.IsCacheFileFor(e.File, e.Realm))
                 managed.Files[e.File] = new ManagedList.Entry(e.Realm, e.Username!, AuthCache.HashOf(File.ReadAllBytes(e.File)));
         }
         managed?.Save();
@@ -438,7 +443,7 @@ static class Program
 sealed class Options
 {
     static readonly HashSet<string> Flags =
-        ["all", "update", "adopt", "dry-run", "force", "run", "stop", "status", "no-cache", "remove", "no-autostart", "help"];
+        ["all", "update", "adopt", "dry-run", "force", "run", "stop", "status", "no-cache", "remove", "no-autostart", "help", "insecure"];
 
     public List<string> Positional { get; } = [];
     readonly Dictionary<string, string> _named = [];

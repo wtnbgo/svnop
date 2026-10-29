@@ -30,13 +30,18 @@ public static class CacheSync
                 continue;
             var file = AuthCache.FileFor(item.Realm);
             var label = $"{item.Realm} ({item.Username})";
-            var same = current.TryGetValue(file, out var cur) && cur.Username == item.Username && cur.Password == item.Password;
+            var sameValue = current.TryGetValue(file, out var cur) && cur.Username == item.Username && cur.Password == item.Password;
+            // 平文 (passtype=simple) で同じ値のものは「最新」とみなさず、暗号化して書き直す
+            var plaintext = sameValue && cur!.PassType != Wincrypt.PassType;
+            var same = sameValue && !plaintext;
             if (same && managed.Files.ContainsKey(file))
             {
                 upToDate++;
                 continue;
             }
-            if (managed.Files.TryGetValue(file, out var m))
+            if (plaintext)
+                report(L.T("平文のキャッシュを暗号化して書き直します: ", "re-encrypting a plain-text cache entry: ") + label);
+            else if (managed.Files.TryGetValue(file, out var m))
             {
                 if (File.Exists(file) && !ManagedList.Unchanged(file, m) && !force)
                 {
@@ -86,8 +91,19 @@ public static class CacheSync
     {
         var managed = ManagedList.Load();
         int removed = 0, kept = 0;
+        var valid = managed.Valid().Select(kv => kv.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var (file, e) in managed.Files.ToList())
         {
+            // 別の場所 (--auth-dir など) の記録には触れない
+            if (!AuthCache.InCurrentDir(file))
+                continue;
+            // 今の場所にあっても、realm から計算した名前と一致しない項目は消さずに記録から外す
+            if (!valid.Contains(file))
+            {
+                report(L.T("管理記録の不正な項目を無視しました: ", "ignored an invalid managed entry: ") + file);
+                managed.Files.Remove(file);
+                continue;
+            }
             if (!File.Exists(file))
             {
                 managed.Files.Remove(file);

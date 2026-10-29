@@ -42,9 +42,20 @@ sealed class Agent : ApplicationContext
         try
         {
             Directory.CreateDirectory(Config.Dir);
-            File.AppendAllText(LogPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {msg}{Environment.NewLine}");
+            File.AppendAllText(LogPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {Sanitize(msg)}{Environment.NewLine}");
         }
-        catch (IOException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+
+    /// <summary>改行などの制御文字をエスケープする (realm やユーザー名でログの行を偽装されないように)</summary>
+    public static string Sanitize(string s)
+    {
+        if (!s.Any(char.IsControl))
+            return s;
+        var sb = new StringBuilder(s.Length);
+        foreach (var c in s)
+            sb.Append(char.IsControl(c) ? $"\\x{(int)c:x2}" : c.ToString());
+        return sb.ToString();
     }
 
     Agent()
@@ -192,10 +203,11 @@ sealed class Agent : ApplicationContext
             return;
         _cfg.CacheMode = mode;
         _cfg.Save();
+        Interlocked.Increment(ref _cacheGen);  // 取得中の同期を取り消す
         Log($"setting: cacheMode = {mode}");
         if (mode == Config.NoCache)
         {
-            var count = ManagedList.Load().Files.Keys.Count(File.Exists);
+            var count = ManagedList.Load().Valid().Count(kv => File.Exists(kv.Key));
             if (count > 0 && MessageBox.Show(
                     T($"svnop が書いた認証キャッシュが {count} 件あります。今消しますか?\n(消さない場合も、以後 svnop はキャッシュに書き込みません)",
                       $"There are {count} cache entries written by svnop. Delete them now?\n(Either way, svnop will no longer write to the cache.)"),
@@ -229,13 +241,40 @@ sealed class Agent : ApplicationContext
 
     // ---- キャッシュの同期 / 削除 ----
 
+    /// <summary>キャッシュへの書き込み (sync) と削除 (lock) を排他する</summary>
+    readonly SemaphoreSlim _cacheLock = new(1, 1);
+    /// <summary>lock や方針変更のたびに増やす。1Password からの取得中にこれが変わった同期は書き込まずに取り消す</summary>
+    int _cacheGen;
+
     async Task RunSync(bool notify, int retries)
     {
         for (var attempt = 0; ; attempt++)
         {
+            if (!_cfg.KeepCache)
+            {
+                Log("sync skipped: cache mode is not keep");
+                return;
+            }
+            var gen = Volatile.Read(ref _cacheGen);
             try
             {
-                var r = await WithOp(() => CacheSync.Sync(_op.ListWithPasswords(), dryRun: false, force: false, Log));
+                var items = await WithOp(() => _op.ListWithPasswords());
+                CacheSync.SyncResult r;
+                await _cacheLock.WaitAsync();
+                try
+                {
+                    // 取得している間に lock / 方針変更があったら書き戻さない
+                    if (!_cfg.KeepCache || gen != Volatile.Read(ref _cacheGen))
+                    {
+                        Log("sync cancelled: the cache was locked or the cache mode changed while fetching");
+                        return;
+                    }
+                    r = CacheSync.Sync(items, dryRun: false, force: false, Log);
+                }
+                finally
+                {
+                    _cacheLock.Release();
+                }
                 Log("sync: " + r.Summary(false));
                 if (notify || r.Written > 0 || r.Skipped > 0)
                     _tray.ShowBalloonTip(5000, "svnop", T("1Password から同期しました: ", "Synced from 1Password: ") + r.Summary(false), ToolTipIcon.Info);
@@ -343,9 +382,19 @@ sealed class Agent : ApplicationContext
         }
     }
 
-    void RunLock()
+    async void RunLock()
     {
-        var r = CacheSync.Lock(force: false, Log);
+        CacheSync.LockResult r;
+        await _cacheLock.WaitAsync();
+        try
+        {
+            Interlocked.Increment(ref _cacheGen);  // 取得中の同期を取り消す
+            r = CacheSync.Lock(force: false, Log);
+        }
+        finally
+        {
+            _cacheLock.Release();
+        }
         Log("lock: " + r.Summary);
         _tray.ShowBalloonTip(5000, "svnop", T("キャッシュを消しました: ", "Cache cleared: ") + r.Summary, ToolTipIcon.Info);
     }
@@ -497,37 +546,92 @@ sealed class Agent : ApplicationContext
 
     void Fill(AuthDialog dlg, string user, string password)
     {
+        if (!dlg.StillValid())
+        {
+            Log($"not filled: the dialog changed or closed while waiting: {dlg.Realm} pid={dlg.Pid}");
+            return;
+        }
         _lastFill[(dlg.Pid, dlg.Realm)] = DateTime.Now;
         // キャッシュを保存する方針なら「認証を保存」を付けたまま送る (認証に成功したときだけ TortoiseSVN が保存する)
         dlg.Fill(user, password, saveAuth: _cfg.KeepCache, _cfg.AutoSubmit);
     }
 
     // ---- 名前付きパイプ (1 行 JSON の要求 → 1 行 JSON の応答) ----
+    //
+    // 信頼モデル: 同じユーザーのプロセスは、1Password の承認が有効な間、agent 経由でパスワードを取得できる
+    // (gpg-agent のキャッシュと同じ水準)。他のユーザーとネットワークからは使えないようにし、
+    // 書き込み (save) は agent 側で利用者に確認する。不要なら config.json の allowPipe を false にする。
+
+    const int MaxRequestBytes = 64 * 1024;
+    const int MaxInstances = 4;
+    static readonly TimeSpan IoTimeout = TimeSpan.FromSeconds(10);
 
     void PipeLoop()
     {
         var security = new PipeSecurity();
         security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User!, PipeAccessRights.FullControl,
                                                   AccessControlType.Allow));
+        // ネットワーク (SMB) 経由の接続は拒否する
+        security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.NetworkSid, null),
+                                                  PipeAccessRights.FullControl, AccessControlType.Deny));
+        var first = true;
         while (!_quit.IsCancellationRequested)
+        {
+            NamedPipeServerStream pipe;
+            try
+            {
+                // 最初のインスタンスは FirstPipeInstance で作る: 同じ名前のパイプを他のプロセスが先に作っていたら失敗する
+                var options = PipeOptions.Asynchronous | (first ? PipeOptions.FirstPipeInstance : PipeOptions.None);
+                pipe = NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, MaxInstances,
+                    PipeTransmissionMode.Byte, options, 0, 0, security);
+            }
+            catch (Exception e) when (first && e is IOException or UnauthorizedAccessException)
+            {
+                Log("pipe: the pipe name is already in use by another process; the pipe is disabled: " + e.Message);
+                return;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // 同時接続数の上限など。少し待って作り直す
+                Log("pipe: " + e.Message);
+                Thread.Sleep(500);
+                continue;
+            }
+            first = false;
+            try
+            {
+                pipe.WaitForConnectionAsync(_quit.Token).GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException) { pipe.Dispose(); break; }
+            catch (IOException e) { Log("pipe: " + e.Message); pipe.Dispose(); continue; }
+            // 接続ごとに別タスクで処理する (1 つの接続で他の要求を止められないように)
+            _ = Task.Run(() => Serve(pipe));
+        }
+    }
+
+    async Task Serve(NamedPipeServerStream pipe)
+    {
+        using (pipe)
         {
             try
             {
-                using var pipe = NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, 1,
-                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security);
-                pipe.WaitForConnectionAsync(_quit.Token).GetAwaiter().GetResult();
-                var reader = new StreamReader(pipe, new UTF8Encoding(false));
-                var line = reader.ReadLine();
-                var response = line == null ? null : HandleRequest(line);
-                if (response != null)
+                string? line;
+                using (var cts = CancellationTokenSource.CreateLinkedTokenSource(_quit.Token))
                 {
-                    var bytes = new UTF8Encoding(false).GetBytes(response.ToJsonString() + "\n");
-                    pipe.Write(bytes);
-                    pipe.Flush();
-                    pipe.WaitForPipeDrain();
+                    cts.CancelAfter(IoTimeout);
+                    line = await ReadLineAsync(pipe, MaxRequestBytes, cts.Token);
+                }
+                if (line == null)
+                    return;
+                var response = HandleRequest(line, ClientDescription(pipe));
+                using (var cts = CancellationTokenSource.CreateLinkedTokenSource(_quit.Token))
+                {
+                    cts.CancelAfter(IoTimeout);
+                    await pipe.WriteAsync(new UTF8Encoding(false).GetBytes(response.ToJsonString() + "\n"), cts.Token);
+                    await pipe.FlushAsync(cts.Token);
                 }
             }
-            catch (OperationCanceledException) { break; }
+            catch (OperationCanceledException) { Log("pipe: request timed out"); }
             catch (Exception e) when (e is IOException or System.Text.Json.JsonException or InvalidOperationException)
             {
                 Log("pipe: " + e.Message);
@@ -535,35 +639,79 @@ sealed class Agent : ApplicationContext
         }
     }
 
-    JsonObject HandleRequest(string line)
+    /// <summary>ログ用: 接続してきたプロセス</summary>
+    static string ClientDescription(NamedPipeServerStream pipe) =>
+        Win32.GetNamedPipeClientProcessId(pipe.SafePipeHandle.DangerousGetHandle(), out var pid)
+            ? $"pid={pid} {Path.GetFileName(Win32.ImagePath(pid) ?? "?")}"
+            : "pid=?";
+
+    /// <summary>改行までを読む (上限を超えたら例外)。接続が切れたら null</summary>
+    static async Task<string?> ReadLineAsync(Stream s, int max, CancellationToken ct)
+    {
+        using var buf = new MemoryStream();
+        var one = new byte[1];
+        while (true)
+        {
+            var n = await s.ReadAsync(one, ct);
+            if (n == 0)
+                return buf.Length == 0 ? null : Encoding.UTF8.GetString(buf.ToArray());
+            if (one[0] == (byte)'\n')
+                return Encoding.UTF8.GetString(buf.ToArray());
+            if (buf.Length >= max)
+                throw new IOException("request too large");
+            buf.WriteByte(one[0]);
+        }
+    }
+
+    JsonObject HandleRequest(string line, string client)
     {
         var req = JsonNode.Parse(line)?.AsObject() ?? [];
-        var cmd = req["cmd"]?.GetValue<string>();
-        var realm = req["realm"]?.GetValue<string>() ?? "";
-        var user = req["user"]?.GetValue<string>() ?? "";
+        var cmd = Str(req, "cmd");
+        var realm = Str(req, "realm");
+        var user = Str(req, "user");
         try
         {
+            // allowPipe=false のときは ping / quit (agent --status / --stop) だけを受け付ける
+            if (cmd is "find" or "save" && !_cfg.AllowPipe)
+                return new JsonObject { ["error"] = "disabled (allowPipe=false)" };
+            if (cmd is "find" or "save" && (realm.Length is 0 or > 1024 || user.Length is 0 or > 256))
+                return new JsonObject { ["error"] = "invalid realm or user" };
             switch (cmd)
             {
                 case "find":
                 {
                     var item = WithOp(() => _op.Find(realm, user)).GetAwaiter().GetResult();
-                    Log($"pipe find: {realm} ({user}) found={item != null}");
+                    Log($"pipe find: {realm} ({user}) found={item != null} from {client}");
                     return item == null
                         ? new JsonObject { ["found"] = false }
                         : new JsonObject { ["found"] = true, ["id"] = item.Id, ["password"] = item.Password };
                 }
                 case "save":
                 {
-                    var pw = req["password"]?.GetValue<string>() ?? "";
+                    var pw = Str(req, "password");
+                    if (pw.Length is 0 or > 4096)
+                        return new JsonObject { ["error"] = "invalid password" };
+                    // 書き込みは利用者に確認する (同じユーザーの任意のプロセスが 1Password を書き換えられないように)
+                    var ok = false;
+                    _ui.Send(_ => ok = MessageBox.Show(
+                        T($"Subversion のパスワードを 1Password に記録しますか?\n\n{realm}\nユーザー: {user}\n\n(要求元: {client})",
+                          $"Record this Subversion password in 1Password?\n\n{realm}\nUser: {user}\n\n(requested by: {client})"),
+                        "svnop", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1,
+                        MessageBoxOptions.DefaultDesktopOnly) == DialogResult.Yes, null);
+                    if (!ok)
+                    {
+                        Log($"pipe save declined: {realm} ({user}) from {client}");
+                        return new JsonObject { ["error"] = "declined" };
+                    }
                     var id = WithOp(() => _op.Save(realm, user, pw, _op.Find(realm, user))).GetAwaiter().GetResult();
                     _list = null;
-                    Log($"pipe save: {realm} ({user}) {id}");
+                    Log($"pipe save: {realm} ({user}) {id} from {client}");
                     return new JsonObject { ["ok"] = true, ["id"] = id };
                 }
                 case "ping":
                     return new JsonObject { ["ok"] = true, ["pid"] = Environment.ProcessId };
                 case "quit":
+                    Log($"pipe quit from {client}");
                     _ui.Post(_ => Quit(), null);
                     return new JsonObject { ["ok"] = true };
                 default:
@@ -577,16 +725,52 @@ sealed class Agent : ApplicationContext
         }
     }
 
-    /// <summary>動いている agent に 1 行 JSON を送って応答を受け取る (動いていなければ null)</summary>
-    public static JsonObject? Call(JsonObject request, int timeoutMs = 2000)
+    static string Str(JsonObject o, string key) =>
+        o[key] is JsonValue v && v.TryGetValue<string>(out var s) ? s : "";
+
+    /// <summary>
+    /// 動いている agent に 1 行 JSON を送って応答を受け取る (動いていなければ null)。
+    /// 偽の agent に秘密を渡さないよう、接続先が同じユーザーの、同じフォルダにある svnop の exe であることを確かめる。
+    /// </summary>
+    public static JsonObject? Call(JsonObject request, int connectTimeoutMs = 2000, int responseTimeoutMs = 300_000)
     {
-        using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut);
-        try { pipe.Connect(timeoutMs); }
+        // CurrentUserOnly: パイプの所有者が現在のユーザーでなければ接続しない
+        using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut,
+                                                   PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        try { pipe.Connect(connectTimeoutMs); }
         catch (TimeoutException) { return null; }
-        var bytes = new UTF8Encoding(false).GetBytes(request.ToJsonString() + "\n");
-        pipe.Write(bytes);
-        pipe.Flush();
-        var line = new StreamReader(pipe, new UTF8Encoding(false)).ReadLine();
-        return line == null ? null : JsonNode.Parse(line)?.AsObject();
+        catch (UnauthorizedAccessException)
+        {
+            throw new SvnOpException(T("svnop のパイプが別のユーザーのものなので接続しません", "the svnop pipe belongs to another user; not connecting"));
+        }
+        // パスワードを送る / 受け取る要求のときは、相手が svnop の agent かを確かめる (ping / quit は秘密を扱わない)
+        if (request["cmd"]?.GetValue<string>() is "find" or "save")
+            VerifyServer(pipe);
+        using var cts = new CancellationTokenSource(responseTimeoutMs);
+        try
+        {
+            pipe.WriteAsync(new UTF8Encoding(false).GetBytes(request.ToJsonString() + "\n"), cts.Token).AsTask().GetAwaiter().GetResult();
+            pipe.FlushAsync(cts.Token).GetAwaiter().GetResult();
+            var line = ReadLineAsync(pipe, 1024 * 1024, cts.Token).GetAwaiter().GetResult();
+            return line == null ? null : JsonNode.Parse(line)?.AsObject();
+        }
+        catch (OperationCanceledException)
+        {
+            throw new SvnOpException(T("agent からの応答がありません", "no response from the agent"));
+        }
+    }
+
+    static void VerifyServer(NamedPipeClientStream pipe)
+    {
+        if (!Win32.GetNamedPipeServerProcessId(pipe.SafePipeHandle.DangerousGetHandle(), out var pid))
+            throw new SvnOpException(T("agent のプロセスを確認できません", "cannot identify the agent process"));
+        var image = Win32.ImagePath(pid);
+        var dir = Path.GetFullPath(AppContext.BaseDirectory).TrimEnd(Path.DirectorySeparatorChar);
+        var ok = image != null
+                 && string.Equals(Path.GetDirectoryName(image), dir, StringComparison.OrdinalIgnoreCase)
+                 && Path.GetFileName(image).ToLowerInvariant() is "svnopw.exe" or "svnop.exe";
+        if (!ok)
+            throw new SvnOpException(T($"パイプの相手が svnop の agent ではありません: {image ?? "?"}",
+                                       $"the pipe server is not the svnop agent: {image ?? "?"}"));
     }
 }

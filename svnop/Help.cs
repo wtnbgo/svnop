@@ -168,6 +168,7 @@ static class Help
               language      auto / ja / en   表示言語 (環境変数 SVNOP_LANG が優先)
               notifyOnFill  true / false   自動入力したら通知する
               autoSubmit    true / false   自動入力の後に OK を押す
+              allowPipe     true / false   msys2 の pinentry からの問い合わせに答える
             トレイメニューの「設定」からも変更できます。
             """,
             """
@@ -182,26 +183,31 @@ static class Help
               language      auto / ja / en   display language (SVNOP_LANG overrides)
               notifyOnFill  true / false   notify when auto-filled
               autoSubmit    true / false   press OK after auto-fill
+              allowPipe     true / false   answer requests from the msys2 pinentry
             These can also be changed from Settings in the tray menu.
             """),
         ["realm"] = (
             """
-            svnop realm <URL>...
+            svnop realm <URL>... [--insecure]
 
             URL に認証なしでアクセスし、Subversion が使う realm 文字列を表示します。
+            https の証明書は検証します。自己署名証明書のサーバでは --insecure を付けてください
+            (検証しない分、通信経路で偽の realm を返されるおそれがあります。パスワードは送りません)。
             形式は「<scheme://host:port> 名前」で、http(s) は Basic / Digest 認証の realm、
             svn:// は svnserve の realm (未設定ならリポジトリの UUID) です。
             """,
             """
-            svnop realm <URL>...
+            svnop realm <URL>... [--insecure]
 
             Accesses the URL without credentials and prints the realm string Subversion uses.
+            https certificates are verified. For a server with a self-signed certificate add --insecure
+            (without verification, an attacker on the network could return a fake realm; no password is sent).
             The format is "<scheme://host:port> name": the Basic / Digest realm for http(s),
             and the svnserve realm (the repository UUID if not configured) for svn://.
             """),
         ["add"] = (
             """
-            svnop add <URL> [--user U] [--realm R] [--no-cache]
+            svnop add <URL> [--user U] [--realm R] [--no-cache] [--insecure]
 
             realm を調べ、ユーザー名とパスワードを入力して 1Password に登録します。
             登録済みなら更新するか確認します。登録後、TortoiseSVN の svn.exe からもすぐ使えるよう
@@ -210,7 +216,7 @@ static class Help
               --realm  realm を調べずに直接指定する
             """,
             """
-            svnop add <URL> [--user U] [--realm R] [--no-cache]
+            svnop add <URL> [--user U] [--realm R] [--no-cache] [--insecure]
 
             Finds the realm, asks for the user name and password, and adds them to 1Password.
             If already registered, asks whether to update. Afterwards the entry is also written to the
@@ -219,8 +225,8 @@ static class Help
               --realm  specify the realm directly instead of probing
             """),
         ["find"] = (
-            "svnop find <URL|realm> [--user U]\n\n1Password に登録があるか確認します。パスワードは表示しません。",
-            "svnop find <URL|realm> [--user U]\n\nChecks whether the realm is registered in 1Password. Passwords are never printed."),
+            "svnop find <URL|realm> [--user U] [--insecure]\n\n1Password に登録があるか確認します。パスワードは表示しません。",
+            "svnop find <URL|realm> [--user U] [--insecure]\n\nChecks whether the realm is registered in 1Password. Passwords are never printed."),
         ["list"] = (
             "svnop list\n\n1Password のタグ svn のアイテムを realm / ユーザー名 / id で一覧表示します。",
             "svnop list\n\nLists 1Password items tagged svn as realm / user name / id."),

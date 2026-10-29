@@ -11,6 +11,7 @@ public sealed class Config
     public string RealmField { get; set; } = "svn_realm";
     public bool AutoSubmit { get; set; } = true;      // agent: 入力後に OK を押す
     public bool NotifyOnFill { get; set; } = true;    // agent: 認証ダイアログに自動入力したらトレイ通知を出す
+    public bool AllowPipe { get; set; } = true;       // agent: msys2 の pinentry 用の名前付きパイプを開く
 
     /// <summary>
     /// 認証キャッシュ (%APPDATA%\Subversion) にパスワードを保存するか。
@@ -44,14 +45,30 @@ public sealed class Config
     {
         if (!File.Exists(FilePath))
             return new Config();
+        Config cfg;
         try
         {
-            return JsonSerializer.Deserialize<Config>(File.ReadAllText(FilePath), JsonOpt) ?? new Config();
+            cfg = JsonSerializer.Deserialize<Config>(File.ReadAllText(FilePath), JsonOpt) ?? new Config();
         }
         catch (JsonException e)
         {
             throw new SvnOpException($"{FilePath}: {e.Message}");
         }
+        cfg.Normalize();
+        return cfg;
+    }
+
+    /// <summary>読み込んだ値の検査: null や範囲外の値は既定値に戻す (後段で例外にしないため)</summary>
+    void Normalize()
+    {
+        Op ??= "";
+        Vault ??= "";
+        Tag = string.IsNullOrWhiteSpace(Tag) ? "svn" : Tag;
+        RealmField = string.IsNullOrWhiteSpace(RealmField) ? "svn_realm" : RealmField;
+        CacheMode = CacheMode is Keep or NoCache ? CacheMode : "";
+        Language = Language is "auto" or "ja" or "en" ? Language : "auto";
+        if (Op.Length > 0 && !Path.IsPathFullyQualified(Op))
+            Op = "";  // 相対パスは使わない (FindOp が自動で探す)
     }
 
     /// <summary>キー名 (camelCase) で値を設定する。svnop config / トレイから使う</summary>
@@ -70,6 +87,7 @@ public sealed class Config
             case "tag": Tag = value; break;
             case "autoSubmit": AutoSubmit = Bool(); break;
             case "notifyOnFill": NotifyOnFill = Bool(); break;
+            case "allowPipe": AllowPipe = Bool(); break;
             case "syncOnStart": SyncOnStart = Bool(); break;
             case "cacheMode":
                 CacheMode = value is Keep or NoCache ? value
@@ -84,7 +102,7 @@ public sealed class Config
         }
     }
 
-    public static readonly string[] Keys = ["cacheMode", "syncOnStart", "vault", "language", "notifyOnFill", "autoSubmit", "op", "tag"];
+    public static readonly string[] Keys = ["cacheMode", "syncOnStart", "vault", "language", "notifyOnFill", "autoSubmit", "allowPipe", "op", "tag"];
 
     public string Get(string key) => key switch
     {
@@ -93,6 +111,7 @@ public sealed class Config
         "tag" => Tag,
         "autoSubmit" => AutoSubmit ? "true" : "false",
         "notifyOnFill" => NotifyOnFill ? "true" : "false",
+        "allowPipe" => AllowPipe ? "true" : "false",
         "syncOnStart" => SyncOnStart ? "true" : "false",
         "cacheMode" => CacheMode,
         "language" => Language,
@@ -114,7 +133,7 @@ public sealed class Config
     public string? FindOp()
     {
         if (Op.Length > 0)
-            return File.Exists(Op) ? ResolveLink(Op) : null;
+            return Path.IsPathFullyQualified(Op) && File.Exists(Op) ? ResolveLink(Op) : null;  // 相対パスは受け付けない
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var packages = Path.Combine(local, "Microsoft", "WinGet", "Packages");
         if (Directory.Exists(packages))
@@ -128,7 +147,7 @@ public sealed class Config
         }
         foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
         {
-            if (dir.Length == 0)
+            if (dir.Length == 0 || !Path.IsPathFullyQualified(dir.Trim()))
                 continue;
             var p = Path.Combine(dir.Trim(), "op.exe");
             if (File.Exists(p))
@@ -151,9 +170,18 @@ public sealed class Config
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return path; }
     }
 
-    public string ResolveOp() => FindOp() ?? throw new SvnOpException(L.T(
-        "op.exe が見つかりません。1Password CLI を導入するか (winget install AgileBits.1Password.CLI)、config.json の op に場所を書いてください",
-        "op.exe not found. Install the 1Password CLI (winget install AgileBits.1Password.CLI) or set \"op\" in config.json"));
+    /// <summary>op.exe の場所。見つからない、または 1Password (AgileBits) の正しい署名が無ければ例外</summary>
+    public string ResolveOp()
+    {
+        var op = FindOp() ?? throw new SvnOpException(L.T(
+            "op.exe が見つかりません。1Password CLI を導入するか (winget install AgileBits.1Password.CLI)、config.json の op に絶対パスで場所を書いてください",
+            "op.exe not found. Install the 1Password CLI (winget install AgileBits.1Password.CLI) or set \"op\" in config.json to an absolute path"));
+        // 偽の op.exe にパスワードを渡さないよう、署名を確かめる
+        if (!Trust.IsSignedBy(op, "AgileBits"))
+            throw new SvnOpException(L.T($"op.exe の署名を確認できません (1Password 公式の op.exe ではない可能性があります): {op}",
+                                         $"cannot verify the signature of op.exe (it may not be the official 1Password CLI): {op}"));
+        return op;
+    }
 }
 
 public sealed class SvnOpException(string message) : Exception(message);

@@ -53,6 +53,15 @@ static class Win32
     public static extern bool SetForegroundWindow(IntPtr hwnd);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint pid);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetNamedPipeClientProcessId(IntPtr pipe, out uint pid);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsChild(IntPtr parent, IntPtr child);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     static extern IntPtr OpenProcess(int access, bool inherit, uint pid);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
